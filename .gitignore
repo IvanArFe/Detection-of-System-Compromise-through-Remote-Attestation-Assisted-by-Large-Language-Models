@@ -1,0 +1,11 @@
+# Credentials
+.env
+
+# Python venv
+venv/
+__pycache__/
+*.pyc
+
+# Time execution data
+kernel_events.json
+execve_events.json
