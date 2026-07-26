@@ -1,15 +1,30 @@
 from bcc import BPF
 import json
+import logging
 import os
+import sys
 import threading
+from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 from datetime import datetime
 import signal
 
+# El transporte stdio de MCP usa stdout para el framing JSON-RPC: cualquier
+# escritura libre ahí corrompe el protocolo. Todo el logging va a stderr.
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(levelname)s] %(message)s",
+    stream=sys.stderr,
+)
+log = logging.getLogger("forensic_mcp")
+
 mcp = FastMCP("Kernel_Forensic")
 
-LOG_FILE = "kernel_events.json"
-EXECVE_LOG_FILE = "execve_events.json"
+# Rutas absolutas derivadas del propio fichero: el servidor funciona
+# independientemente del directorio desde el que se lance.
+BASE_DIR = Path(__file__).resolve().parent
+LOG_FILE = BASE_DIR / "kernel_events.json"
+EXECVE_LOG_FILE = BASE_DIR / "execve_events.json"
 
 # ──────────────────────────────────────────────
 # MCP Tools
@@ -228,8 +243,8 @@ fnname_init  = b.get_syscall_fnname("init_module")
 b.attach_kprobe(event=fnname_finit, fn_name="kprobe_monitor")
 b.attach_kprobe(event=fnname_init,  fn_name="kprobe_monitor")
 
-print(f"[*] Monitoring syscalls: {fnname_finit}, {fnname_init}, syscalls:sys_enter_execve")
-print("[*] Sensor active. Waiting for events...\n")
+log.info("Monitoring syscalls: %s, %s, syscalls:sys_enter_execve", fnname_finit, fnname_init)
+log.info("Sensor active. Waiting for events...")
 
 
 # ──────────────────────────────────────────────

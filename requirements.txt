@@ -9,4 +9,4 @@ mcp==1.27.0
 requests==2.33.1
 pytest==9.0.3
 python-dotenv==1.2.2
-supabase
+supabase==2.29.0

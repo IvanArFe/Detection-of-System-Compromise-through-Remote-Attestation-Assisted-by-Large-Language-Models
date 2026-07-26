@@ -9,3 +9,12 @@ __pycache__/
 # Time execution data
 kernel_events.json
 execve_events.json
+*.jsonl
+
+# Tests
+.pytest_cache/
+
+# Laboratorio y evidencia (fases 6-7)
+lab/results/
+quarantine/
+edr.db

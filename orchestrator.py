@@ -2,13 +2,19 @@ import asyncio
 import re
 import requests
 import os
+import sys
+from pathlib import Path
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from dotenv import load_dotenv
 import db
 import json
 
-load_dotenv()
+# Rutas absolutas derivadas del propio fichero: el orquestador ya no depende
+# del directorio desde el que se lance.
+BASE_DIR = Path(__file__).resolve().parent
+
+load_dotenv(BASE_DIR / ".env")
 
 # Ollama configuration
 OLLAMA_URL = "http://localhost:11434/api/generate"
@@ -51,12 +57,13 @@ def parse_decision(text):
 
 
 async def run_orchestrator():
-    actual_path = os.getcwd()
-    python_venv = os.path.join(actual_path, "venv/bin/python3")
-
+    # El servidor MCP se lanza con el mismo intérprete y los mismos privilegios
+    # que el orquestador. Antes se anteponía "sudo": si sudo pedía contraseña,
+    # el prompt se mezclaba con el canal stdio JSON-RPC y la sesión MCP moría
+    # sin ningún mensaje de error.
     server_params = StdioServerParameters(
-        command="sudo",
-        args=[python_venv, os.path.join(actual_path, "forensic_mcp.py")],
+        command=sys.executable,
+        args=[str(BASE_DIR / "forensic_mcp.py")],
     )
 
     async with stdio_client(server_params) as (read, write):
@@ -193,4 +200,11 @@ DECISION: NOTHING
                 await asyncio.sleep(20)
 
 if __name__ == "__main__":
+    # eBPF y la inspección de /proc de otros procesos requieren root. Fallar
+    # aquí con un mensaje claro evita un cuelgue opaco al arrancar el sensor.
+    if os.geteuid() != 0:
+        sys.exit(
+            "[!] Este programa necesita root (eBPF y /proc).\n"
+            "    Ejecuta: sudo venv/bin/python3 orchestrator.py"
+        )
     asyncio.run(run_orchestrator())
