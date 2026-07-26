@@ -44,6 +44,46 @@ TABLES = [
         );
         """,
     ),
+    (
+        "detections: columnas de métricas y de las fases 5-7",
+        # Se añaden ahora aunque casi ninguna se rellene todavía: migrar una tabla
+        # con datos es bastante más incómodo que crear columnas vacías hoy. La fase
+        # 2 ya empieza a producir model, latency_ms y los contadores de tokens.
+        """
+        ALTER TABLE detections
+            ADD COLUMN IF NOT EXISTS model           TEXT,
+            ADD COLUMN IF NOT EXISTS latency_ms      INTEGER,
+            ADD COLUMN IF NOT EXISTS tokens_in       INTEGER,
+            ADD COLUMN IF NOT EXISTS tokens_out      INTEGER,
+            ADD COLUMN IF NOT EXISTS severity        INTEGER,
+            ADD COLUMN IF NOT EXISTS mitre_technique TEXT,
+            ADD COLUMN IF NOT EXISTS rules_fired     TEXT,
+            ADD COLUMN IF NOT EXISTS run_id          TEXT,
+            ADD COLUMN IF NOT EXISTS scenario        TEXT;
+        """,
+    ),
+    (
+        "detections: permitir pid y process nulos",
+        # Un veredicto NOTHING no lleva PID, y esas filas son imprescindibles para
+        # calcular la tasa de falsos negativos. Con NOT NULL no se pueden insertar.
+        """
+        ALTER TABLE detections ALTER COLUMN pid     DROP NOT NULL;
+        ALTER TABLE detections ALTER COLUMN process DROP NOT NULL;
+        """,
+    ),
+    (
+        "índices",
+        # La consulta de deduplicación (pid + process + created_at) hacía un
+        # escaneo completo de la tabla en cada ciclo.
+        """
+        CREATE INDEX IF NOT EXISTS ix_detections_dedup
+            ON detections (pid, process, created_at DESC);
+        CREATE INDEX IF NOT EXISTS ix_detections_created
+            ON detections (created_at DESC);
+        CREATE INDEX IF NOT EXISTS ix_evidence_detection
+            ON evidence (detection_id);
+        """,
+    ),
 ]
 
 
@@ -82,9 +122,12 @@ def main():
     project_ref = get_project_ref(supabase_url)
     print(f"[*] Setting up database for project: {project_ref}")
 
+    # Todas las sentencias son idempotentes (IF NOT EXISTS / DROP NOT NULL sobre
+    # una columna que ya lo permite), así que el script se puede relanzar sin
+    # riesgo cada vez que el esquema evolucione.
     for name, sql in TABLES:
         run_sql(project_ref, access_token, sql)
-        print(f"[+] Table '{name}' ready.")
+        print(f"[+] {name}: OK")
 
     print("\n[+] Database setup complete.")
 

@@ -77,8 +77,17 @@ def _warn_once(e):
 
 
 def log_detection(pid, process, decision, action, llm_round1,
-                  llm_round2=None, remediation=None):
-    """Inserta una detección. Devuelve su UUID, o None si no se pudo persistir."""
+                  llm_round2=None, remediation=None, **extra):
+    """Inserta una detección. Devuelve su UUID, o None si no se pudo persistir.
+
+    `extra` recoge las columnas añadidas para las fases 5-7 (`model`, `latency_ms`,
+    `tokens_in`, `tokens_out`, `severity`, `mitre_technique`…). Se aceptan como
+    kwargs para que añadir una métrica nueva no obligue a cambiar esta firma.
+
+    `pid` y `process` pueden ser None: un veredicto NOTHING sin PID también se
+    registra, porque sin esas filas no se puede calcular la tasa de falsos
+    negativos.
+    """
     row = {
         "pid": pid,
         "process": process,
@@ -87,6 +96,7 @@ def log_detection(pid, process, decision, action, llm_round1,
         "llm_round1": llm_round1,
         "llm_round2": llm_round2,
         "remediation": remediation,
+        **extra,
     }
     try:
         res = get_client().table("detections").insert(row).execute()

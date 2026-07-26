@@ -130,8 +130,10 @@ def test_un_pid_alucinado_no_correlaciona():
     assert orchestrator.find_event_for_pid(eventos, 4242) is None
 
 
-def test_parse_alerts_tolera_texto_de_error():
+def test_parse_json_list_tolera_texto_de_error():
     """Las herramientas MCP devuelven texto plano ante un fallo, no JSON."""
-    assert orchestrator.parse_alerts("[!] Error reading alerts file") == []
-    assert orchestrator.parse_alerts("No security alerts for now.") == []
-    assert orchestrator.parse_alerts('{"no": "es una lista"}') == []
+    assert orchestrator.parse_json_list("[!] Error reading alerts file") == []
+    assert orchestrator.parse_json_list("[tool-error] get_kernel_alerts: timeout") == []
+    assert orchestrator.parse_json_list("No security alerts for now.") == []
+    assert orchestrator.parse_json_list('{"no": "es una lista"}') == []
+    assert orchestrator.parse_json_list('[{"pid": 1}]') == [{"pid": 1}]

@@ -70,6 +70,45 @@ RATE_LIMIT_MAX = int(os.environ.get("EDR_RATE_LIMIT_MAX", "3"))
 RATE_LIMIT_WINDOW_S = float(os.environ.get("EDR_RATE_LIMIT_WINDOW", "300"))
 
 # ──────────────────────────────────────────────
+# Modelo y cliente de Ollama
+# ──────────────────────────────────────────────
+
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+MODEL = os.environ.get("EDR_MODEL", "llama3.1:8b")
+
+# (conexión, lectura). Sin timeout, un Ollama colgado cuelga el EDR para siempre.
+# La lectura es generosa porque una primera inferencia en frío carga ~5 GB en VRAM.
+LLM_CONNECT_TIMEOUT = float(os.environ.get("EDR_LLM_CONNECT_TIMEOUT", "5"))
+LLM_READ_TIMEOUT = float(os.environ.get("EDR_LLM_READ_TIMEOUT", "180"))
+
+# El contexto por defecto de Ollama 0.32 es 4096, y un prompt de ronda 2 con 50
+# eventos execve ya ocupa ~2563 tokens solo en esa sección. Se sube a 8192 y
+# además se recorta explícitamente en edr/prompts.py: medido que Ollama descarta
+# la CABEZA del prompt y conserva la cola, así que un desbordamiento no rompe el
+# veredicto pero borra la evidencia en silencio.
+LLM_NUM_CTX = int(os.environ.get("EDR_LLM_NUM_CTX", "8192"))
+LLM_NUM_PREDICT = int(os.environ.get("EDR_LLM_NUM_PREDICT", "512"))
+
+# Temperatura baja: las decisiones deben ser reproducibles. Si repetir el
+# laboratorio da resultados distintos, la comparativa de modelos no vale nada.
+LLM_TEMPERATURE = float(os.environ.get("EDR_LLM_TEMPERATURE", "0.1"))
+LLM_TOP_P = float(os.environ.get("EDR_LLM_TOP_P", "0.9"))
+
+# Sin esto, el modelo se descarga de VRAM entre ciclos de 20 s.
+LLM_KEEP_ALIVE = os.environ.get("EDR_LLM_KEEP_ALIVE", "30m")
+
+# ──────────────────────────────────────────────
+# Presupuesto de contexto (edr/prompts.py)
+# ──────────────────────────────────────────────
+
+MAX_ALERTS = int(os.environ.get("EDR_MAX_ALERTS", "10"))
+MAX_EXECVE = int(os.environ.get("EDR_MAX_EXECVE", "20"))
+MAX_FDS = int(os.environ.get("EDR_MAX_FDS", "30"))
+MAX_CONNECTIONS = int(os.environ.get("EDR_MAX_CONNECTIONS", "15"))
+MAX_FIELD_CHARS = int(os.environ.get("EDR_MAX_FIELD_CHARS", "256"))
+MAX_SECTION_CHARS = int(os.environ.get("EDR_MAX_SECTION_CHARS", "4000"))
+
+# ──────────────────────────────────────────────
 # Event store
 # ──────────────────────────────────────────────
 

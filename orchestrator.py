@@ -1,17 +1,22 @@
+"""Bucle de decisión del EDR.
+
+Cliente MCP que sondea las alertas del sensor, se las plantea al modelo y actúa
+según su veredicto. Toda la lógica delicada vive en `edr/`: aquí solo queda la
+coreografía.
+"""
+
 import asyncio
 import json
 import os
-import re
 import sys
 from pathlib import Path
 
-import requests
 from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 import db
-from edr import config
+from edr import config, decision, llm, prompts
 
 # Rutas absolutas derivadas del propio fichero: el orquestador ya no depende
 # del directorio desde el que se lance.
@@ -19,54 +24,36 @@ BASE_DIR = Path(__file__).resolve().parent
 
 load_dotenv(BASE_DIR / ".env")
 
-# Ollama configuration
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL = "llama3.1:8b"
-
 POLL_INTERVAL_S = 20
+TOOL_TIMEOUT_S = 30
 
 
-async def ask_ollama(prompt):
-    """ Send forensic context to Ollama and obtain an answer """
-    payload = {
-        "model": MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "system": (
-            "You are a Senior Linux Security Analyst and Incident Responder. "
-            "Your task is to analyze kernel telemetry and decide on the next steps. "
-            "IMPORTANT: All your reasoning and decisions MUST be written in English. "
-            "Be concise and technical."
-        )
-    }
-    response = requests.post(OLLAMA_URL, json=payload)
-    return response.json().get("response", "")
+# ──────────────────────────────────────────────
+# Utilidades
+# ──────────────────────────────────────────────
 
+async def safe_tool(session, name, **args):
+    """Invoca una herramienta MCP sin que un fallo suyo tumbe el bucle.
 
-def parse_decision(text):
+    Una herramienta puede fallar por motivos perfectamente normales —el proceso
+    murió mientras se le preguntaba— y eso no debe interrumpir el ciclo de
+    decisión. El error se devuelve como texto para que quede en la evidencia.
     """
-    Extracts the structured DECISION line from the LLM response.
-    Returns a tuple: (action, pid, action_param)
-    """
-    mitigate = re.search(r"DECISION:\s*MITIGATE\s+pid=(\d+)\s+action=(freeze|kill)", text)
-    if mitigate:
-        return ("MITIGATE", int(mitigate.group(1)), mitigate.group(2))
-
-    investigate = re.search(r"DECISION:\s*INVESTIGATE\s+pid=(\d+)", text)
-    if investigate:
-        return ("INVESTIGATE", int(investigate.group(1)), None)
-
-    if "DECISION: NOTHING" in text:
-        return ("NOTHING", None, None)
-
-    return ("NOTHING", None, None)
-
-
-def parse_alerts(data):
-    """Convierte la respuesta de get_kernel_alerts en una lista de eventos."""
     try:
-        events = json.loads(data)
-        return events if isinstance(events, list) else []
+        result = await asyncio.wait_for(
+            session.call_tool(name, arguments=args or None), timeout=TOOL_TIMEOUT_S)
+        return result.content[0].text if result.content else ""
+    except asyncio.TimeoutError:
+        return f"[tool-error] {name} no respondió en {TOOL_TIMEOUT_S}s"
+    except Exception as e:  # noqa: BLE001
+        return f"[tool-error] {name}: {type(e).__name__}: {e}"
+
+
+def parse_json_list(data):
+    """Convierte la respuesta de una herramienta en lista. Vacía si no es JSON."""
+    try:
+        parsed = json.loads(data)
+        return parsed if isinstance(parsed, list) else []
     except (json.JSONDecodeError, TypeError):
         return []
 
@@ -74,13 +61,10 @@ def parse_alerts(data):
 def find_event_for_pid(events, pid):
     """Localiza el evento que corresponde al PID decidido por el modelo.
 
-    Antes se cogía `events[0]`, es decir el PRIMER evento del lote, sin ninguna
-    relación con el PID elegido: los campos `pid` y `process` que se guardaban en
-    la base de datos podían pertenecer a procesos distintos. Además es de aquí de
-    donde sale el `starttime` que protege contra la reutilización de PID, así que
-    la correlación tiene que ser exacta.
-
-    Se recorre de atrás hacia delante para quedarse con la aparición más reciente.
+    Antes se cogía `events[0]`, el primer evento del lote, sin ninguna relación con
+    el PID elegido: los campos `pid` y `process` que se guardaban podían pertenecer
+    a procesos distintos. Además es de aquí de donde sale el `starttime` que
+    protege contra la reutilización de PID.
     """
     for event in reversed(events):
         if event.get("pid") == pid:
@@ -88,134 +72,134 @@ def find_event_for_pid(events, pid):
     return None
 
 
-async def investigate(session, pid, data):
-    """Recopila evidencia forense y pide al modelo un veredicto final."""
-    print(f"[*] Investigating PID {pid}...")
+async def ask(prompt, allowed_pids, allow_investigate=True):
+    """Consulta al modelo y devuelve (Decision, LLMResult).
 
-    resources = (await session.call_tool(
-        "inspect_pid_resources", arguments={"pid": pid})).content[0].text
-    network = (await session.call_tool(
-        "inspect_pid_network", arguments={"pid": pid})).content[0].text
-    execve = (await session.call_tool(
-        "get_execve_events", arguments={"pid": pid})).content[0].text
+    Ante una respuesta ininteligible se reintenta una vez con un prompt correctivo.
+    Los modelos pequeños fallan el formato con cierta frecuencia y un reintento
+    recupera la mayoría de esos casos.
+    """
+    schema = decision.schema(allow_investigate=allow_investigate)
 
-    print(f"[*] Files:   {resources}")
-    print(f"[*] Network: {network}")
-    print(f"[*] Execve:  {execve}")
+    result = await llm.ask(prompt, schema=schema)
+    verdict = decision.decide(result, allowed_pids)
 
-    prompt_round2 = f"""
-KERNEL EVENTS DETECTED:
-{data}
+    if verdict.action == decision.INVALID and result.ok:
+        print(f"[!] Veredicto no interpretable ({verdict.detail}). Reintentando…")
+        result = await llm.ask(prompt + prompts.RETRY_SUFFIX, schema=schema)
+        verdict = decision.decide(result, allowed_pids)
 
-FORENSIC EVIDENCE FOR PID {pid}:
+    return verdict, result
 
-Open file descriptors:
-{resources}
 
-Active network connections:
-{network}
+def describe(verdict, result):
+    metrics = ""
+    if result and result.ok:
+        metrics = (f" [{result.latency_ms} ms, "
+                   f"{result.tokens_in}→{result.tokens_out} tokens, "
+                   f"vía {verdict.source}]")
+    detail = f" — {verdict.detail}" if verdict.detail else ""
+    return (f"{verdict.action} pid={verdict.pid} "
+            f"action={verdict.remediation}{detail}{metrics}")
 
-Process executions (this PID and its children):
-{execve}
 
-Based on all evidence above, make a final decision:
-- MITIGATE: if the process is confirmed malicious
-- NOTHING: if the process appears legitimate
+# ──────────────────────────────────────────────
+# Ciclo de decisión
+# ──────────────────────────────────────────────
 
-End your response with EXACTLY one of these lines:
-DECISION: MITIGATE pid={pid} action=freeze
-DECISION: MITIGATE pid={pid} action=kill
-DECISION: NOTHING
-"""
-    llm_response2 = await ask_ollama(prompt_round2)
-    print(f"\n[AI round 2]: {llm_response2}")
+async def investigate(session, pid, alerts):
+    """Recopila evidencia forense y pide un veredicto final."""
+    print(f"[*] Investigando PID {pid}…")
 
-    return llm_response2, {
+    resources = await safe_tool(session, "inspect_pid_resources", pid=pid)
+    network = await safe_tool(session, "inspect_pid_network", pid=pid)
+    execve_raw = await safe_tool(session, "get_execve_events", pid=pid)
+
+    print(f"[*] Descriptores: {resources[:120]}")
+    print(f"[*] Red:          {network[:120]}")
+
+    prompt, allowed = prompts.round2(
+        pid, alerts, resources, network, parse_json_list(execve_raw))
+
+    verdict, result = await ask(prompt, allowed, allow_investigate=False)
+    print(f"\n[IA ronda 2]: {result.text[:600]}")
+    print(f"[*] Veredicto: {describe(verdict, result)}")
+
+    evidence = {
         "inspect_pid_resources": resources,
         "inspect_pid_network": network,
-        "get_execve_events": execve,
+        "get_execve_events": execve_raw,
     }
+    return verdict, result, evidence
 
 
-async def handle_alerts(session, data, events):
+async def handle_alerts(session, alerts):
     """Procesa un lote de alertas: razonamiento, investigación y remediación."""
-    print("[!] Alert detected, consulting AI (round 1)...")
+    print("[!] Alerta detectada, consultando a la IA (ronda 1)…")
 
-    prompt_round1 = f"""
-KERNEL EVENTS DETECTED:
-{data}
+    prompt, allowed = prompts.round1(alerts)
+    verdict, result = await ask(prompt, allowed)
 
-INSTRUCTIONS:
-1. Analyze the PID and the command that loaded the kernel module.
-2. Evaluate if the behavior is suspicious (e.g., unexpected module loading by an unknown process).
-3. Choose one of the following actions:
-   - INVESTIGATE: if you need more context before deciding (open files, network, etc.)
-   - MITIGATE: if you are certain this is a threat and must act immediately
-   - NOTHING: if the behavior appears to be a legitimate system action
+    if not result.ok:
+        # Sin modelo no hay decisión. Se registra y se sigue: el sensor no para.
+        print(f"[!] El modelo no respondió: {result.error}")
+        db.log_detection(pid=None, process=None, decision=decision.INVALID,
+                         action=None, llm_round1=f"[error] {result.error}",
+                         model=result.model)
+        return
 
-Provide your reasoning first. Then end your response with EXACTLY one of these lines:
-DECISION: INVESTIGATE pid=<pid>
-DECISION: MITIGATE pid=<pid> action=freeze
-DECISION: MITIGATE pid=<pid> action=kill
-DECISION: NOTHING
-"""
-    llm_response = await ask_ollama(prompt_round1)
-    print(f"\n[AI round 1]: {llm_response}")
+    print(f"\n[IA ronda 1]: {result.text[:600]}")
+    print(f"[*] Veredicto: {describe(verdict, result)}")
 
-    action, pid, action_param = parse_decision(llm_response)
-    print(f"[*] Parsed decision: {action} | pid={pid} | action={action_param}")
-
-    # Correlacionar el PID decidido con SU evento: de ahí salen tanto el nombre
-    # del proceso como la identidad que impide actuar sobre un PID reciclado.
-    event = find_event_for_pid(events, pid) if pid is not None else None
-    process = event.get("comm", "unknown") if event else "unknown"
+    # Correlacionar el PID decidido con SU evento: de ahí salen el nombre del
+    # proceso y la identidad que impide actuar sobre un PID reciclado.
+    event = find_event_for_pid(alerts, verdict.pid) if verdict.pid else None
+    process = event.get("comm") if event else None
     expected_starttime = event.get("starttime") if event else None
 
-    if pid is not None and event is None:
-        # El modelo ha devuelto un PID que no estaba en la telemetría que se le
-        # dio: o lo ha alucinado, o procede de una inyección en el prompt.
-        print(f"[!] AVISO: el PID {pid} no aparece en las alertas presentadas.")
+    if verdict.pid is not None and db.was_recently_investigated(verdict.pid, process):
+        print(f"[DB] PID {verdict.pid} ({process}) ya analizado hace poco, se omite.")
+        return
 
-    detection_id = None
-    if pid is not None:
-        if db.was_recently_investigated(pid, process):
-            print(f"[DB] PID {pid} ({process}) already investigated recently, avoiding.")
-            return
-        detection_id = db.log_detection(
-            pid=pid,
-            process=process,
-            decision=action,
-            action=action_param,
-            llm_round1=llm_response,
-        )
+    # Se registra TODA decisión, incluidas las NOTHING sin PID. Sin esas filas no
+    # se puede calcular la tasa de falsos negativos.
+    detection_id = db.log_detection(
+        pid=verdict.pid,
+        process=process,
+        decision=verdict.action,
+        action=verdict.remediation,
+        llm_round1=result.text,
+        model=result.model,
+        latency_ms=result.latency_ms,
+        tokens_in=result.tokens_in,
+        tokens_out=result.tokens_out,
+    )
 
-    if action == "INVESTIGATE":
-        llm_response2, evidence = await investigate(session, pid, data)
-        action, pid, action_param = parse_decision(llm_response2)
-        print(f"[*] Parsed decision: {action} | pid={pid} | action={action_param}")
-
+    if verdict.action == decision.INVESTIGATE:
+        verdict, result2, evidence = await investigate(session, verdict.pid, alerts)
         if detection_id:
-            for tool, result in evidence.items():
-                db.log_evidence(detection_id, tool, result)
-            db.update_detection(detection_id, llm_round2=llm_response2,
-                                decision=action, action=action_param)
+            for tool, value in evidence.items():
+                db.log_evidence(detection_id, tool, value)
+            db.update_detection(detection_id, llm_round2=result2.text,
+                                decision=verdict.action, action=verdict.remediation)
 
-    if action == "MITIGATE" and pid is not None:
-        print(f"[!] Executing remediation on PID {pid} (action={action_param})...")
+    if verdict.action == decision.MITIGATE and verdict.pid is not None:
+        print(f"[!] Remediando PID {verdict.pid} (acción={verdict.remediation})…")
         # expected_starttime lo aporta el orquestador desde el evento original,
         # nunca el modelo: así no puede saltarse la validación de identidad.
-        remediation = (await session.call_tool("remediate_incident", arguments={
-            "pid": pid,
-            "action": action_param,
-            "expected_starttime": expected_starttime,
-            "reason": f"LLM verdict on {process}",
-        })).content[0].text
-        print(f"[!] Remediation result: {remediation}")
+        remediation = await safe_tool(
+            session, "remediate_incident",
+            pid=verdict.pid, action=verdict.remediation,
+            expected_starttime=expected_starttime,
+            reason=f"veredicto del LLM sobre {process}")
+        print(f"[!] Resultado: {remediation}")
         if detection_id:
             db.update_detection(detection_id, remediation=remediation)
 
-    elif action == "NOTHING":
-        print("[-] No action taken.")
+    elif verdict.action == decision.NOTHING:
+        print("[-] Sin acción.")
+    elif verdict.action == decision.INVALID:
+        print(f"[!] Veredicto inutilizable tras el reintento: {verdict.detail}")
 
 
 async def run_orchestrator():
@@ -231,35 +215,37 @@ async def run_orchestrator():
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            print("[-] Connecting to MCP forensic server...")
-            print(f"[-] Remediation mode: {config.EDR_MODE}")
+            print("[-] Conectado al servidor forense MCP.")
+            print(f"[-] Modelo: {config.MODEL} (num_ctx={config.LLM_NUM_CTX})")
+            print(f"[-] Modo de remediación: {config.EDR_MODE}")
 
             while True:
-                print("\n[*] Monitoring kernel alerts...")
+                print("\n[*] Consultando alertas del kernel…")
 
-                alerts_result = await session.call_tool("get_kernel_alerts")
-                data = alerts_result.content[0].text
+                data = await safe_tool(session, "get_kernel_alerts")
 
-                if "No security alerts for now" in data:
-                    print("[-] No alarms in kernel.")
+                if "No security alerts for now" in data or data.startswith("[tool-error]"):
+                    if data.startswith("[tool-error]"):
+                        print(f"[!] {data}")
+                    else:
+                        print("[-] Sin alertas.")
                     await asyncio.sleep(POLL_INTERVAL_S)
                     continue
 
-                events = parse_alerts(data)
-                max_seq = max((e.get("seq", 0) for e in events), default=0)
+                alerts = parse_json_list(data)
+                max_seq = max((e.get("seq", 0) for e in alerts), default=0)
 
                 try:
-                    await handle_alerts(session, data, events)
+                    await handle_alerts(session, alerts)
                 finally:
                     # Confirmar SIEMPRE, incluso si el ciclo falló a medias. Si un
                     # error transitorio impidiera confirmar, esas mismas alertas se
                     # reanalizarían en cada vuelta para siempre — que es justo el
-                    # comportamiento que esta fase elimina. La evidencia no se
+                    # comportamiento que la fase 1 eliminó. La evidencia no se
                     # pierde: sigue en el JSONL y en la base de datos.
                     if max_seq:
-                        await session.call_tool(
-                            "ack_alerts", arguments={"max_seq": max_seq})
-                        print(f"[*] Alerts acknowledged up to seq={max_seq}.")
+                        await safe_tool(session, "ack_alerts", max_seq=max_seq)
+                        print(f"[*] Alertas confirmadas hasta seq={max_seq}.")
 
                 await asyncio.sleep(POLL_INTERVAL_S)
 

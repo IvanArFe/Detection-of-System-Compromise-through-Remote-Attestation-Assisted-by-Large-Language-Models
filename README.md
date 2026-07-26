@@ -16,13 +16,15 @@ Tres capas que se comunican por MCP sobre transporte stdio:
 ┌─ forensic_mcp.py ──────────────┐      ┌─ orchestrator.py ─────────────────┐
 │  (proceso root)                │      │  (proceso root)                   │
 │                                │      │                                   │
-│  Hilos del sensor eBPF         │◄────►│  Cliente MCP                      │
-│   → kernel_events.json         │ MCP  │   → consulta alertas cada 20 s    │
-│      (carga de módulos)        │stdio │   → envía la telemetría a Ollama  │
-│   → execve_events.json         │      │   → parsea el veredicto           │
-│      (ejecución de procesos)   │      │   → invoca herramientas MCP       │
-│                                │      │   → bucle de dos rondas           │
-│  Servidor FastMCP              │      │                                   │
+│  Hilos del sensor eBPF         │      │  Cliente MCP                      │
+│   kprobe init_module           │      │   → consulta alertas cada 20 s    │
+│   tracepoint sys_enter_execve  │      │   → sanea y presupuesta el prompt │
+│            │                   │ MCP  │   → consulta a Ollama             │
+│            ▼                   │stdio │   → interpreta el veredicto       │
+│      EventStore  ──────────────┼─────►│   → invoca herramientas MCP       │
+│   (memoria + events.jsonl)     │      │   → bucle de dos rondas           │
+│                                │      │                                   │
+│  Servidor FastMCP              │      │   → confirma con ack_alerts       │
 │   herramientas forenses ───────┼──────┤   → persiste en Supabase          │
 └────────────────────────────────┘      └───────────────────────────────────┘
                                                         │
@@ -34,13 +36,17 @@ Tres capas que se comunican por MCP sobre transporte stdio:
 
 1. Los kprobes de eBPF sobre `init_module` / `finit_module` capturan cargas de módulos de kernel.
 2. Un tracepoint sobre `sys_enter_execve` captura todas las ejecuciones de procesos.
-3. El orquestador consulta `get_kernel_alerts` cada 20 segundos.
-4. Si hay alertas, el LLM responde en la **ronda 1** con un veredicto estructurado:
-   `DECISION: INVESTIGATE pid=X` / `DECISION: MITIGATE pid=X action=freeze|kill` / `DECISION: NOTHING`.
-5. Si es `INVESTIGATE`, el orquestador recopila evidencia forense (descriptores abiertos, conexiones
-   de red, ejecuciones del proceso y sus hijos) y la envía al LLM en la **ronda 2** para un veredicto
-   final.
-6. Si es `MITIGATE`, se invoca `remediate_incident`: `SIGSTOP` (freeze) o `SIGKILL` (kill).
+3. Ambos callbacks añaden el evento al `EventStore`: en memoria bajo un lock, y como línea en
+   `events.jsonl` para el registro forense.
+4. El orquestador consulta `get_kernel_alerts` cada 20 segundos. **Solo recibe lo aún no confirmado.**
+5. La telemetría se sanea y se recorta antes de entrar en el prompt. El LLM responde en la **ronda 1**
+   con `INVESTIGATE`, `MITIGATE` o `NOTHING`, por salida estructurada JSON o, en su defecto, por una
+   línea `DECISION:` que se parsea anclada al final.
+6. Si es `INVESTIGATE`, se recopila evidencia forense (descriptores, conexiones, ejecuciones del
+   proceso y sus hijos) y se envía en la **ronda 2** para el veredicto final.
+7. Si es `MITIGATE`, se invoca `remediate_incident` con el `starttime` del evento original, que pasa
+   por las siete salvaguardas antes de señalizar nada.
+8. `ack_alerts` cierra el ciclo para que esas alertas no se reanalicen.
 
 ### Herramientas MCP
 
@@ -75,6 +81,28 @@ proceso es el par `(pid, starttime)`, no el PID.
 
 **`EDR_MODE` viene en `dry-run` por defecto**: el sistema razona, decide y valida, pero no envía la
 señal. Para que actúe de verdad, `EDR_MODE=autonomous`.
+
+### Robustez de la decisión
+
+El veredicto del modelo no se toma al pie de la letra. Se lee por dos vías, en orden de preferencia:
+la **salida estructurada nativa** de Ollama con un JSON Schema, y como respaldo un **parser anclado**
+que recorre las líneas de abajo arriba exigiendo que la línea entera sea el veredicto.
+
+Tres defensas se refuerzan entre sí:
+
+| Defensa | Ataque que corta |
+|---|---|
+| `fullmatch` sobre la línea completa, de abajo arriba | Una frase que *menciona* o *niega* un veredicto deja de contar |
+| Ejemplos con el literal `pid=<PID>` | El modelo repite las instrucciones y el eco no es accionable |
+| `allowed_pids` sacado de la telemetría mostrada | Un PID alucinado o inyectado se rechaza |
+
+Además, todo dato controlable por el atacante (`comm`, rutas, argumentos) se sanea antes de entrar en
+el prompt y la evidencia va encapsulada entre delimitadores marcados explícitamente como dato no
+confiable.
+
+**`INVALID` no es lo mismo que `NOTHING`.** Antes ambos colapsaban, así que "el modelo no supo
+responder" era indistinguible de "el modelo decidió no actuar" — cosas muy distintas al calcular
+falsos negativos.
 
 ---
 
@@ -166,10 +194,11 @@ sudo venv/bin/python3 forensic_mcp.py
 venv/bin/python3 -m pytest -q
 ```
 
-84 tests en unos 3 segundos. **Sin root, sin BCC y sin red**, a propósito: son para ejecutarlos
+165 tests en unos 4 segundos. **Sin root, sin BCC y sin red**, a propósito: son para ejecutarlos
 constantemente mientras se desarrolla. Cubren el parseo de `/proc` (incluidos los `comm` patológicos
 como `(sd-pam)`), la concurrencia del almacén de eventos (20 hilos × 500 escrituras con lecturas
-simultáneas) y las siete salvaguardas de remediación.
+simultáneas), las salvaguardas de remediación, y la interpretación del veredicto del modelo —
+incluidas las inyecciones de prompt y el eco de las instrucciones.
 
 ---
 
@@ -216,6 +245,9 @@ edr/                     Núcleo: lógica pura, importable sin root ni BCC
   procinfo.py            Lectura de /proc e identidad (pid, starttime)
   eventstore.py          Almacén de eventos thread-safe
   safety.py              Salvaguardas de remediación y modos de operación
+  llm.py                 Cliente de Ollama con timeout, options y métricas
+  prompts.py             Sanitización y presupuesto de contexto
+  decision.py            Interpretación del veredicto (estructurada + parser)
 tests/                   Suite sin root, sin BCC y sin red
 docker-compose.yml       Ollama con passthrough de GPU
 scripts/
