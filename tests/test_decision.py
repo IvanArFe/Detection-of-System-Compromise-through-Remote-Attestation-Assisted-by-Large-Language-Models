@@ -179,6 +179,31 @@ def test_pid_admite_null_para_poder_expresar_no_aplica():
     assert "null" in schema()["properties"]["pid"]["type"]
 
 
+def test_el_esquema_acota_el_pid_a_los_presentados():
+    """Regresión: el modelo devolvía el `ppid` en lugar del `pid`.
+
+    La telemetría muestra `pid=108630 ppid=108629` y respondía `108629`, de forma
+    sistemática y también en el reintento. No era alucinación sino confusión entre
+    dos campos numéricos contiguos. Acotar el campo por `enum` lo hace imposible:
+    la gramática derivada del esquema no puede generar otro valor.
+    """
+    campo = schema(allowed_pids={108630, 108640})["properties"]["pid"]
+
+    assert campo["enum"] == [108630, 108640, None]
+    assert 108629 not in campo["enum"], "el ppid contiguo debe quedar fuera"
+
+
+def test_sin_lista_de_pids_el_campo_queda_abierto():
+    """Permite usar el esquema suelto, sin una telemetría concreta detrás."""
+    assert "enum" not in schema()["properties"]["pid"]
+    assert "enum" not in schema(allowed_pids=set())["properties"]["pid"]
+
+
+def test_null_sigue_permitido_al_acotar():
+    """Un veredicto NOTHING no lleva PID: el enum tiene que admitir null."""
+    assert None in schema(allowed_pids={1234})["properties"]["pid"]["enum"]
+
+
 # ── decide(): elección de vía ──────────────────────────────────
 
 def test_decide_prefiere_la_via_estructurada():

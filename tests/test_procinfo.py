@@ -169,3 +169,32 @@ def test_cmdline_separa_por_nulos(fake_proc):
 def test_cmdline_vacio_de_hilo_de_kernel(fake_proc):
     fake_proc(pid=81, comm="kworker", kthread=True, cmdline=[])
     assert procinfo.cmdline(81) == ""
+
+
+# ── conversión de unidades entre la sonda y /proc ──────────────
+# La sonda eBPF lee `task->start_boottime` en nanosegundos; /proc expone el mismo
+# instante en ticks de reloj. Si la conversión no fuera exacta, la comprobación
+# `pid_reused` fallaría siempre y no se podría remediar nada.
+
+def test_ns_a_ticks():
+    assert procinfo.ns_to_ticks(15_083_530_000_000) == 1_508_353
+    assert procinfo.ns_to_ticks(0) == 0
+    assert procinfo.ns_to_ticks(None) is None
+
+
+def test_ns_a_ticks_trunca_como_el_kernel():
+    """`nsec_to_clock_t` es una división entera: se trunca, no se redondea."""
+    tick = procinfo.NS_PER_TICK
+    assert procinfo.ns_to_ticks(tick - 1) == 0
+    assert procinfo.ns_to_ticks(tick) == 1
+    assert procinfo.ns_to_ticks(tick * 2 - 1) == 1
+
+
+def test_la_conversion_coincide_con_proc(live_process):
+    """La comprobación que de verdad importa, contra un proceso real.
+
+    Se reconstruyen los nanosegundos a partir de los ticks que da /proc y se
+    vuelve a convertir: el ciclo tiene que cerrar exacto.
+    """
+    ticks = procinfo.starttime(live_process.pid)
+    assert procinfo.ns_to_ticks(ticks * procinfo.NS_PER_TICK) == ticks

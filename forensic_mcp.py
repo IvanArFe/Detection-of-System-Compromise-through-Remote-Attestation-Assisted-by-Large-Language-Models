@@ -10,6 +10,7 @@ La carga del programa eBPF ocurre dentro de `start_sensors()`, no al importar el
 módulo. Es lo que permite `import forensic_mcp` sin root para poder testear.
 """
 
+import ctypes as ct
 import json
 import logging
 import os
@@ -18,7 +19,7 @@ import threading
 
 from mcp.server.fastmcp import FastMCP
 
-from edr import config, procinfo, safety
+from edr import config, netinfo, procinfo, safety
 from edr.eventstore import EventStore
 
 # El transporte stdio de MCP usa stdout para el framing JSON-RPC: cualquier
@@ -36,8 +37,9 @@ mcp = FastMCP("Kernel_Forensic")
 # Sustituye a los dos ficheros JSON que se reescribían enteros sin sincronización.
 STORE = EventStore(config.EVENTS_JSONL, cap=config.EVENT_CAP)
 
-# Handle del programa BPF. Lo rellena start_sensors().
+# Handle del programa BPF y estado del enganche. Los rellena start_sensors().
 _bpf = None
+PROBES = {"attached": [], "failed": []}
 
 
 # ──────────────────────────────────────────────
@@ -77,17 +79,25 @@ def inspect_pid_resources(pid: int) -> str:
     if not os.path.exists(path):
         return f"[!] Error: PID {pid} does not exist or cannot be accessed."
     try:
-        files = []
-        for fd in os.listdir(path):
-            full_path = os.readlink(os.path.join(path, fd))
-            files.append(full_path)
-        if not files:
-            return f"[!] Process {pid} has no detectable open files."
-        return "Opened files for process:\n- " + "\n- ".join(files)
+        entries = os.listdir(path)
     except PermissionError:
         return f"[!] Insufficient permissions to inspect PID {pid}."
-    except Exception as e:
-        return f"[!] Unexpected error: {str(e)}"
+    except OSError as e:
+        return f"[!] Unexpected error: {e}"
+
+    files = []
+    for fd in entries:
+        try:
+            files.append(os.readlink(os.path.join(path, fd)))
+        except OSError:
+            # Un descriptor que se cierra entre el listdir y el readlink es lo
+            # normal en /proc, no una anomalía. Antes esta excepción escapaba al
+            # manejador exterior y se perdía el resultado ENTERO.
+            continue
+
+    if not files:
+        return f"[!] Process {pid} has no detectable open files."
+    return "Opened files for process:\n- " + "\n- ".join(files)
 
 
 @mcp.tool()
@@ -97,68 +107,37 @@ def inspect_pid_network(pid: int) -> str:
     if not os.path.exists(fd_path):
         return f"[!] Error: PID {pid} does not exist or cannot be accessed."
 
-    # Collect socket inodes owned by this PID from /proc/{pid}/fd
     socket_inodes = set()
     try:
         for fd in os.listdir(fd_path):
             try:
                 link = os.readlink(os.path.join(fd_path, fd))
-                if link.startswith("socket:["):
-                    socket_inodes.add(link[8:-1])  # extract inode number
             except OSError:
                 continue
+            if link.startswith("socket:["):
+                socket_inodes.add(link[8:-1])
     except PermissionError:
         return f"[!] Insufficient permissions to inspect PID {pid}."
+    except OSError as e:
+        return f"[!] Unexpected error: {e}"
 
     if not socket_inodes:
         return f"[-] PID {pid} has no open sockets."
 
-    TCP_STATES = {
-        "01": "ESTABLISHED", "02": "SYN_SENT", "03": "SYN_RECV",
-        "04": "FIN_WAIT1",   "05": "FIN_WAIT2", "06": "TIME_WAIT",
-        "07": "CLOSE",       "08": "CLOSE_WAIT", "09": "LAST_ACK",
-        "0A": "LISTEN",      "0B": "CLOSING",
-    }
-
-    def decode_ipv4(hex_str):
-        # /proc/net/tcp stores IPs in little-endian hex: reverse byte order
-        addr = int(hex_str, 16)
-        return (f"{addr & 0xFF}.{(addr >> 8) & 0xFF}."
-                f"{(addr >> 16) & 0xFF}.{(addr >> 24) & 0xFF}")
-
-    def parse_tcp_file(path):
-        conns = []
-        if not os.path.exists(path):
-            return conns
+    connections = []
+    for table in (f"/proc/{pid}/net/tcp", f"/proc/{pid}/net/tcp6"):
         try:
-            with open(path) as f:
-                next(f)  # skip header line
+            with open(table) as f:
+                next(f)  # cabecera
                 for line in f:
-                    parts = line.split()
-                    if len(parts) < 10:
-                        continue
-                    inode = parts[9]
-                    if inode not in socket_inodes:
-                        continue
-                    local_ip, local_port = parts[1].split(":")
-                    remote_ip, remote_port = parts[2].split(":")
-                    state = TCP_STATES.get(parts[3].upper(), parts[3])
-                    conns.append(
-                        f"{decode_ipv4(local_ip)}:{int(local_port, 16)} → "
-                        f"{decode_ipv4(remote_ip)}:{int(remote_port, 16)} [{state}]"
-                    )
-        except Exception as e:
-            conns.append(f"[!] Error reading {path}: {e}")
-        return conns
-
-    connections = (
-        parse_tcp_file(f"/proc/{pid}/net/tcp") +
-        parse_tcp_file(f"/proc/{pid}/net/tcp6")
-    )
+                    conn = netinfo.format_connection(line, socket_inodes)
+                    if conn:
+                        connections.append(conn)
+        except (OSError, StopIteration):
+            continue
 
     if not connections:
         return f"[-] No active TCP connections found for PID {pid}."
-
     return f"TCP connections for PID {pid}:\n" + "\n".join(f"  {c}" for c in connections)
 
 
@@ -180,10 +159,10 @@ def remediate_incident(pid: int, action: str = "kill",
                        reason: str = "") -> str:
     """Congela (SIGSTOP) o termina (SIGKILL) un proceso, con salvaguardas.
 
-    La remediación pasa por siete comprobaciones antes de enviar nada: PID
+    La remediación pasa por varias comprobaciones antes de enviar nada: PID
     remediable, acción válida, autoprotección del EDR y sus ancestros, hilos de
-    kernel, procesos críticos protegidos, coincidencia de identidad contra la
-    reutilización de PID, y límite de tasa.
+    kernel, procesos críticos protegidos, identidad conocida, coincidencia contra
+    la reutilización de PID, y límite de tasa.
 
     `expected_starttime` lo rellena el orquestador a partir del evento original,
     nunca el modelo. Si no coincide con el valor actual, el PID pertenece ya a
@@ -195,106 +174,223 @@ def remediate_incident(pid: int, action: str = "kill",
 
 @mcp.tool()
 def sensor_stats() -> str:
-    """Contadores del almacén de eventos: útiles para diagnóstico y rendimiento."""
-    return json.dumps(STORE.stats(), indent=2)
+    """Estado de los sensores: eventos, descartes y cobertura real de sondas."""
+    stats = STORE.stats()
+    stats["probes_attached"] = PROBES["attached"]
+    stats["probes_failed"] = PROBES["failed"]
+    stats["ringbuf_dropped"] = _ringbuf_dropped()
+    return json.dumps(stats, indent=2, ensure_ascii=False)
 
 
 # ──────────────────────────────────────────────
-# eBPF programs
+# eBPF program
 # ──────────────────────────────────────────────
+
+# Identificadores de tipo de evento. Deben coincidir con _KIND_NAMES de abajo.
+KIND_MODULE_LOAD = 1
+KIND_EXECVE = 2
+
+_KIND_NAMES = {
+    KIND_MODULE_LOAD: config.KIND_MODULE_LOAD,
+    KIND_EXECVE: config.KIND_EXECVE,
+}
 
 ebpf_code = """
 #include <linux/sched.h>
 
-/* ── Module load tracing ── */
+#define KIND_MODULE_LOAD 1
+#define KIND_EXECVE      2
 
-struct data_t {
-    u32 pid;
-    char command[16];
-    char message[64];
-};
-
-BPF_PERF_OUTPUT(eventos);
-
-int kprobe_monitor(void *ctx) {
-    struct data_t data = {};
-    data.pid = bpf_get_current_pid_tgid() >> 32;
-    bpf_get_current_comm(&data.command, sizeof(data.command));
-    __builtin_memcpy(data.message, "Kernel module load detected", 27);
-    eventos.perf_submit(ctx, &data, sizeof(data));
-    return 0;
-}
-
-/* ── execve tracing ── */
-
-struct exec_data_t {
+/* Cabecera común a todos los eventos. Va embebida al principio de cada struct
+ * concreta en vez de usarse una unión: una unión gastaría en CADA evento el
+ * tamaño del mayor de todos, desperdiciando espacio del ring buffer. */
+struct ev_hdr {
+    u64 ts_ns;
+    u64 start_boottime;
+    u64 cgroup_id;
     u32 pid;
     u32 ppid;
-    char command[16];
+    u32 uid;
+    u32 kind;
+    char comm[16];
+};
+
+struct module_event_t {
+    struct ev_hdr hdr;
+};
+
+struct exec_event_t {
+    struct ev_hdr hdr;
     char filename[128];
 };
 
-BPF_PERF_OUTPUT(exec_events);
+/* Un único ring buffer para todos los sensores: da ordenación global entre tipos
+ * de evento, hace menos copias que un buffer por sensor y consume menos CPU. */
+BPF_RINGBUF_OUTPUT(events, 64);
 
-TRACEPOINT_PROBE(syscalls, sys_enter_execve) {
-    struct exec_data_t data = {};
+/* El ring buffer descarta cuando se llena. Sin este contador la pérdida sería
+ * invisible, que es justo lo que pasaba antes al no usar el lost_cb del perf
+ * buffer. */
+BPF_ARRAY(dropped, u64, 1);
 
-    data.pid = bpf_get_current_pid_tgid() >> 32;
+static __always_inline void fill_hdr(struct ev_hdr *hdr, u32 kind) {
+    hdr->ts_ns = bpf_ktime_get_ns();
+    hdr->pid = bpf_get_current_pid_tgid() >> 32;
+    hdr->uid = (u32)bpf_get_current_uid_gid();
+    hdr->cgroup_id = bpf_get_current_cgroup_id();
+    hdr->kind = kind;
+    bpf_get_current_comm(&hdr->comm, sizeof(hdr->comm));
 
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-    struct task_struct *parent;
+    struct task_struct *parent = NULL;
     bpf_probe_read_kernel(&parent, sizeof(parent), &task->real_parent);
-    bpf_probe_read_kernel(&data.ppid, sizeof(data.ppid), &parent->tgid);
+    if (parent) {
+        bpf_probe_read_kernel(&hdr->ppid, sizeof(hdr->ppid), &parent->tgid);
+    }
 
-    bpf_get_current_comm(&data.command, sizeof(data.command));
-    bpf_probe_read_user_str(data.filename, sizeof(data.filename), args->filename);
+    /* LA razón de ser de esta fase. Leer la identidad AQUÍ, dentro de la sonda,
+     * es la única forma de obtenerla: el callback de userspace corre cientos de
+     * milisegundos después y para entonces los procesos de vida corta ya no
+     * existen. Se midió 0 identidades capturadas de 2905 eventos.
+     *
+     * Es start_boottime, no start_time: desde la 5.5 el kernel calcula con el
+     * primero el campo 22 de /proc/{pid}/stat, contra el que se compara luego. */
+    bpf_probe_read_kernel(&hdr->start_boottime, sizeof(hdr->start_boottime),
+                          &task->start_boottime);
+}
 
-    exec_events.perf_submit(args, &data, sizeof(data));
+static __always_inline void count_drop() {
+    u32 key = 0;
+    u64 *slot = dropped.lookup(&key);
+    if (slot) {
+        __sync_fetch_and_add(slot, 1);
+    }
+}
+
+int kprobe_module_load(struct pt_regs *ctx) {
+    struct module_event_t ev = {};
+    fill_hdr(&ev.hdr, KIND_MODULE_LOAD);
+    if (events.ringbuf_output(&ev, sizeof(ev), 0) < 0) {
+        count_drop();
+    }
+    return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_enter_execve) {
+    struct exec_event_t ev = {};
+    fill_hdr(&ev.hdr, KIND_EXECVE);
+    bpf_probe_read_user_str(ev.filename, sizeof(ev.filename), args->filename);
+    if (events.ringbuf_output(&ev, sizeof(ev), 0) < 0) {
+        count_drop();
+    }
     return 0;
 }
 """
 
 
 # ──────────────────────────────────────────────
-# Event callbacks
+# Espejo en ctypes del esquema de evento
 # ──────────────────────────────────────────────
+
+class EvHdr(ct.Structure):
+    """Debe coincidir campo a campo con `struct ev_hdr` del programa eBPF.
+
+    El orden importa: los u64 van primero para que la estructura quede alineada
+    sin relleno, de modo que el tamaño en C y en ctypes coincida exactamente.
+    """
+    _fields_ = [
+        ("ts_ns", ct.c_uint64),
+        ("start_boottime", ct.c_uint64),
+        ("cgroup_id", ct.c_uint64),
+        ("pid", ct.c_uint32),
+        ("ppid", ct.c_uint32),
+        ("uid", ct.c_uint32),
+        ("kind", ct.c_uint32),
+        ("comm", ct.c_char * 16),
+    ]
+
+
+class ModuleEvent(ct.Structure):
+    _fields_ = [("hdr", EvHdr)]
+
+
+class ExecEvent(ct.Structure):
+    _fields_ = [("hdr", EvHdr), ("filename", ct.c_char * 128)]
+
 
 def _decode(raw):
     return raw.decode(errors="replace").strip("\x00")
 
 
-def procesar_evento(cpu, data, size):
-    evento = _bpf["eventos"].event(data)
-    pid = evento.pid
-    STORE.append(
-        config.KIND_MODULE_LOAD,
-        pid=pid,
-        comm=_decode(evento.command),
-        # La identidad se captura AQUÍ, milisegundos después del evento, no
-        # cuando el modelo decide actuar decenas de segundos más tarde. Es lo que
-        # reduce la ventana de reutilización de PID de segundos a milisegundos.
-        # Si el proceso ya murió queda a None y la remediación se denegará.
-        starttime=procinfo.starttime(pid),
-        detail=_decode(evento.message),
-    )
+def _hdr_fields(hdr):
+    """Campos comunes que se guardan en el almacén de eventos."""
+    return {
+        "pid": hdr.pid,
+        "ppid": hdr.ppid,
+        "uid": hdr.uid,
+        "comm": _decode(hdr.comm),
+        # Se convierte a ticks aquí, no en el kernel: el evento sigue llevando el
+        # campo `starttime` con la misma semántica y unidades que antes, así que
+        # ni safety.py ni procinfo.py necesitan cambiar.
+        "starttime": procinfo.ns_to_ticks(hdr.start_boottime),
+        "cgroup_id": hdr.cgroup_id,
+    }
 
 
-def procesar_exec_evento(cpu, data, size):
-    evento = _bpf["exec_events"].event(data)
-    pid = evento.pid
-    STORE.append(
-        config.KIND_EXECVE,
-        pid=pid,
-        ppid=evento.ppid,
-        comm=_decode(evento.command),
-        filename=_decode(evento.filename),
-        starttime=procinfo.starttime(pid),
-    )
+def handle_event(data, size):
+    """Despacha un evento del ring buffer según su `kind`.
+
+    Con un único buffer para todos los sensores, el tipo va en la cabecera y hay
+    que reinterpretar el búfer en consecuencia.
+    """
+    hdr = ct.cast(data, ct.POINTER(EvHdr)).contents
+    kind = _KIND_NAMES.get(hdr.kind)
+    if kind is None:
+        log.warning("evento de tipo desconocido: %s", hdr.kind)
+        return
+
+    fields = _hdr_fields(hdr)
+
+    if hdr.kind == KIND_EXECVE:
+        ev = ct.cast(data, ct.POINTER(ExecEvent)).contents
+        fields["filename"] = _decode(ev.filename)
+    else:
+        fields["detail"] = "Kernel module load detected"
+
+    STORE.append(kind, **fields)
+
+
+def _ringbuf_dropped():
+    """Eventos que el kernel descartó por ring buffer lleno."""
+    if _bpf is None:
+        return 0
+    try:
+        return _bpf["dropped"][ct.c_int(0)].value
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 # ──────────────────────────────────────────────
 # Sensor startup
 # ──────────────────────────────────────────────
+
+def _attach(description, fn):
+    """Engancha una sonda sin que su fallo impida arrancar el resto.
+
+    Antes, un solo `attach_kprobe` fallido lanzaba excepción y el sensor no
+    arrancaba en absoluto. Con más sondas por venir —algunas dependientes de
+    símbolos que pueden no existir en otro kernel— eso significaría perder toda la
+    detección por un sensor indisponible.
+    """
+    try:
+        fn()
+        PROBES["attached"].append(description)
+        return True
+    except Exception as e:  # noqa: BLE001
+        PROBES["failed"].append(f"{description}: {e}")
+        log.warning("no se pudo enganchar %s: %s", description, e)
+        return False
+
 
 def start_sensors():
     """Compila el programa eBPF, engancha las sondas y arranca el hilo de sondeo.
@@ -308,20 +404,30 @@ def start_sensors():
 
     _bpf = BPF(text=ebpf_code)
 
-    fnname_finit = _bpf.get_syscall_fnname("finit_module")
-    fnname_init = _bpf.get_syscall_fnname("init_module")
-    _bpf.attach_kprobe(event=fnname_finit, fn_name="kprobe_monitor")
-    _bpf.attach_kprobe(event=fnname_init, fn_name="kprobe_monitor")
+    # El tracepoint de execve lo engancha BCC automáticamente al cargar, por usar
+    # la macro TRACEPOINT_PROBE. Los kprobes se enganchan uno a uno.
+    PROBES["attached"].append("tracepoint:syscalls:sys_enter_execve")
 
-    log.info("Monitorizando: %s, %s, syscalls:sys_enter_execve", fnname_finit, fnname_init)
+    for syscall in ("finit_module", "init_module"):
+        fnname = _bpf.get_syscall_fnname(syscall)
+        _attach(
+            f"kprobe:{syscall}",
+            lambda f=fnname: _bpf.attach_kprobe(event=f, fn_name="kprobe_module_load"),
+        )
+
+    if not PROBES["attached"]:
+        log.error("ninguna sonda enganchada: el sensor no capturará nada")
+
+    log.info("Sondas activas: %s", ", ".join(PROBES["attached"]))
+    if PROBES["failed"]:
+        log.warning("Sondas fallidas: %s", "; ".join(PROBES["failed"]))
     log.info("Modo de remediación: %s", config.EDR_MODE)
     log.info("Registro de eventos: %s", config.EVENTS_JSONL)
 
     def run():
-        _bpf["eventos"].open_perf_buffer(procesar_evento)
-        _bpf["exec_events"].open_perf_buffer(procesar_exec_evento)
+        _bpf["events"].open_ring_buffer(lambda ctx, data, size: handle_event(data, size))
         while True:
-            _bpf.perf_buffer_poll()
+            _bpf.ring_buffer_poll(100)
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()

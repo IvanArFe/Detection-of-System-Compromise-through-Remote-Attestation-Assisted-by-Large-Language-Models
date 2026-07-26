@@ -79,7 +79,10 @@ async def ask(prompt, allowed_pids, allow_investigate=True):
     Los modelos pequeños fallan el formato con cierta frecuencia y un reintento
     recupera la mayoría de esos casos.
     """
-    schema = decision.schema(allow_investigate=allow_investigate)
+    # Los PIDs candidatos entran en el propio esquema: la gramática impide que el
+    # modelo emita otro valor, en vez de tener que rechazarlo después.
+    schema = decision.schema(allow_investigate=allow_investigate,
+                             allowed_pids=allowed_pids)
 
     result = await llm.ask(prompt, schema=schema)
     verdict = decision.decide(result, allowed_pids)

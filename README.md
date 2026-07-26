@@ -58,7 +58,25 @@ Tres capas que se comunican por MCP sobre transporte stdio:
 | `inspect_pid_network(pid)` | Conexiones TCP activas, cruzando inodos de socket con `/proc/{pid}/net/tcp` |
 | `get_execve_events(pid)` | Ejecuciones del PID o de sus hijos directos |
 | `remediate_incident(pid, action, expected_starttime, reason)` | Congela (`SIGSTOP`) o termina (`SIGKILL`) un proceso, tras siete validaciones |
-| `sensor_stats()` | Contadores del almacén de eventos |
+| `sensor_stats()` | Contadores de eventos, descartes y cobertura real de sondas |
+
+### Telemetría
+
+Todos los sensores emiten una **cabecera común** (`ts`, identidad, `cgroup_id`, `pid`, `ppid`, `uid`,
+`comm`) embebida al principio de su propia estructura, sobre un **único ring buffer**. Un solo buffer
+da ordenación global entre tipos de evento y hace menos copias que uno por sensor.
+
+La identidad del proceso se lee **dentro de la sonda**, no en el callback de userspace. Es la única
+forma de obtenerla: el callback corre cientos de milisegundos después y para entonces los procesos de
+vida corta ya no existen — se midieron 0 identidades capturadas sobre 2905 eventos con el enfoque
+anterior.
+
+Las pérdidas se cuentan por separado en dos puntos: `ringbuf_dropped` cuando el kernel descarta por
+buffer lleno, y `dropped` cuando el almacén en memoria alcanza su tope. Antes se perdían eventos en
+silencio.
+
+Si una sonda no se puede enganchar, se registra y **las demás siguen funcionando**. `sensor_stats()`
+declara con qué cobertura real se está ejecutando.
 
 ### Salvaguardas de respuesta
 
@@ -146,6 +164,7 @@ comprueba que los enlaces existan bajo `venv/lib/python3.13/site-packages/`.
 ```bash
 # 1. Verificar que todo está en su sitio
 bash scripts/preflight.sh
+sudo venv/bin/python3 scripts/check-bpf.py   # compila y carga el programa eBPF
 
 # 2. Levantar Ollama
 docker compose up -d
@@ -194,7 +213,7 @@ sudo venv/bin/python3 forensic_mcp.py
 venv/bin/python3 -m pytest -q
 ```
 
-165 tests en unos 4 segundos. **Sin root, sin BCC y sin red**, a propósito: son para ejecutarlos
+209 tests en unos 4 segundos. **Sin root, sin BCC y sin red**, a propósito: son para ejecutarlos
 constantemente mientras se desarrolla. Cubren el parseo de `/proc` (incluidos los `comm` patológicos
 como `(sd-pam)`), la concurrencia del almacén de eventos (20 hilos × 500 escrituras con lecturas
 simultáneas), las salvaguardas de remediación, y la interpretación del veredicto del modelo —
@@ -248,9 +267,11 @@ edr/                     Núcleo: lógica pura, importable sin root ni BCC
   llm.py                 Cliente de Ollama con timeout, options y métricas
   prompts.py             Sanitización y presupuesto de contexto
   decision.py            Interpretación del veredicto (estructurada + parser)
+  netinfo.py             Decodificación de /proc/net/tcp e IPv6
 tests/                   Suite sin root, sin BCC y sin red
 docker-compose.yml       Ollama con passthrough de GPU
 scripts/
   preflight.sh           Comprobaciones previas al arranque
+  check-bpf.py           Compila y carga el programa eBPF (requiere root)
   install-docker-wsl.sh  Docker Engine + NVIDIA Container Toolkit en WSL2
 ```

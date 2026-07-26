@@ -81,7 +81,11 @@ def sanitize(value, max_len=None):
 # modelo leyó `starttime: null` y confabuló que "podría indicar que fueron cargados
 # por un proceso padre o un disparador externo". No significa nada de eso: es un
 # fallo interno de captura. Los nulos internos no deben llegar al prompt.
-_INTERNAL_FIELDS = {"seq", "kind", "starttime", "ts"}
+#
+# `cgroup_id` se oculta por otro motivo: es un entero de 64 bits que sirve para
+# etiquetar contenedores y VMs en el laboratorio, no para razonar sobre una
+# amenaza. Mostrarlo solo gastaría contexto.
+_INTERNAL_FIELDS = {"seq", "kind", "starttime", "ts", "cgroup_id"}
 
 
 def _short_time(iso_ts):

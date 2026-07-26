@@ -130,6 +130,38 @@ def test_un_pid_alucinado_no_correlaciona():
     assert orchestrator.find_event_for_pid(eventos, 4242) is None
 
 
+# ── inspect_pid_resources: la carrera de descriptores ──────────
+
+def test_un_descriptor_que_desaparece_no_pierde_el_resto(live_process, monkeypatch):
+    """Antes, un solo readlink fallido descartaba el resultado ENTERO.
+
+    Que un descriptor se cierre entre el listdir y el readlink es lo normal en
+    /proc, no una anomalía.
+    """
+    real_readlink = forensic_mcp.os.readlink
+    llamadas = {"n": 0}
+
+    def readlink_inestable(path):
+        llamadas["n"] += 1
+        if llamadas["n"] == 2:          # el segundo descriptor "se cierra"
+            raise FileNotFoundError(path)
+        return real_readlink(path)
+
+    monkeypatch.setattr(forensic_mcp.os, "readlink", readlink_inestable)
+
+    salida = forensic_mcp.inspect_pid_resources(live_process.pid)
+    assert "Opened files" in salida
+    assert "Error" not in salida
+
+
+def test_inspect_pid_resources_con_pid_inexistente():
+    assert "does not exist" in forensic_mcp.inspect_pid_resources(999999)
+
+
+def test_inspect_pid_network_con_pid_inexistente():
+    assert "does not exist" in forensic_mcp.inspect_pid_network(999999)
+
+
 def test_parse_json_list_tolera_texto_de_error():
     """Las herramientas MCP devuelven texto plano ante un fallo, no JSON."""
     assert orchestrator.parse_json_list("[!] Error reading alerts file") == []

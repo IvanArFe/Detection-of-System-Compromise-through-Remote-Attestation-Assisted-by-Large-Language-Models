@@ -61,7 +61,7 @@ class Decision:
 # Capa 1: salida estructurada
 # ──────────────────────────────────────────────
 
-def schema(allow_investigate=True):
+def schema(allow_investigate=True, allowed_pids=None):
     """JSON Schema para el parámetro `format` de Ollama.
 
     **Todos los campos son obligatorios, y eso importa.** En la verificación de la
@@ -73,15 +73,35 @@ def schema(allow_investigate=True):
     Un campo opcional es un campo que el modelo va a omitir. `pid` y `remediation`
     admiten `null` para que pueda expresar "no aplica" sin romper el esquema, pero
     tiene que emitirlos.
+
+    **`pid` se restringe por `enum` a los PIDs realmente presentados.** En la
+    verificación de la Fase 3a, 2 de 3 ciclos se perdieron porque el modelo devolvía
+    el `ppid` en lugar del `pid`: la telemetría muestra `pid=108630 ppid=108629` y
+    respondía `108629`. No era una alucinación, sino la confusión de dos campos
+    numéricos contiguos — y ocurrió de forma sistemática, también en el reintento.
+
+    Acotar el campo con un `enum` convierte el error en imposible: la gramática que
+    Ollama deriva del esquema no puede generar otro valor. Es el mismo mecanismo que
+    ya funcionaba para `action`, y validado contra el modelo real (3/3 correctos
+    donde antes fallaba). Mucho más sólido que confiar en que copie bien un número
+    de seis cifras teniendo otro parecido al lado.
     """
     actions = list(VALID_ACTIONS) if allow_investigate else [MITIGATE, NOTHING]
+
+    if allowed_pids:
+        # `null` sigue permitido: es lo que corresponde a un veredicto NOTHING.
+        pid_field = {"enum": sorted(allowed_pids) + [None],
+                     "description": "must be one of the PIDs listed in the telemetry"}
+    else:
+        pid_field = {"type": ["integer", "null"],
+                     "description": "PID from the telemetry; null only for NOTHING"}
+
     return {
         "type": "object",
         "properties": {
             "reasoning": {"type": "string"},
             "action": {"type": "string", "enum": actions},
-            "pid": {"type": ["integer", "null"],
-                    "description": "PID from the telemetry; null only for NOTHING"},
+            "pid": pid_field,
             "remediation": {"type": ["string", "null"],
                             "enum": list(VALID_REMEDIATIONS) + [None],
                             "description": "only meaningful when action is MITIGATE"},

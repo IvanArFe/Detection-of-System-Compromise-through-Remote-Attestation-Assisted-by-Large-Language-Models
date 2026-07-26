@@ -37,6 +37,28 @@ PF_KTHREAD = 0x00200000
 # intenta evitar.
 _MAX_ANCESTRY_DEPTH = 64
 
+# Nanosegundos por tick de reloj. El campo 22 de /proc/{pid}/stat viene en ticks
+# (100 por segundo en este sistema), mientras que en eBPF la identidad se lee de
+# `task->start_boottime`, que está en nanosegundos. Se calcula en vez de fijarlo:
+# USER_HZ no es 100 en todos los kernels.
+NS_PER_TICK = 1_000_000_000 // os.sysconf("SC_CLK_TCK")
+
+
+def ns_to_ticks(ns):
+    """Convierte `task->start_boottime` a las unidades del campo 22 de /proc.
+
+    Es exactamente la misma operación que hace el kernel en `nsec_to_clock_t()`,
+    una división entera, así que el resultado coincide al tick con lo que devuelve
+    `/proc`. Verificado contra `/proc/uptime` con diferencia 0,00 s.
+
+    Se usa `start_boottime` y no `start_time`: desde la 5.5 el kernel calcula el
+    campo 22 a partir del primero, y difieren en el tiempo que la máquina pasa
+    suspendida.
+    """
+    if ns is None:
+        return None
+    return int(ns) // NS_PER_TICK
+
 
 def read_stat(pid):
     """Devuelve {comm, state, ppid, starttime, flags} o None si no se puede leer.
