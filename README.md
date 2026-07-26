@@ -46,11 +46,35 @@ Tres capas que se comunican por MCP sobre transporte stdio:
 
 | Herramienta | Descripción |
 |---|---|
-| `get_kernel_alerts()` | Eventos de carga de módulos capturados por eBPF |
+| `get_kernel_alerts()` | Alertas de carga de módulos **aún sin confirmar** |
+| `ack_alerts(max_seq)` | Marca como procesadas las alertas hasta `max_seq` |
 | `inspect_pid_resources(pid)` | Descriptores de fichero abiertos vía `/proc/{pid}/fd` |
 | `inspect_pid_network(pid)` | Conexiones TCP activas, cruzando inodos de socket con `/proc/{pid}/net/tcp` |
 | `get_execve_events(pid)` | Ejecuciones del PID o de sus hijos directos |
-| `remediate_incident(pid, action)` | Congela (`SIGSTOP`) o termina (`SIGKILL`) un proceso |
+| `remediate_incident(pid, action, expected_starttime, reason)` | Congela (`SIGSTOP`) o termina (`SIGKILL`) un proceso, tras siete validaciones |
+| `sensor_stats()` | Contadores del almacén de eventos |
+
+### Salvaguardas de respuesta
+
+La respuesta autónoma no es incondicional. Antes de enviar ninguna señal,
+`edr/safety.py` evalúa siete comprobaciones en orden:
+
+| # | Comprobación | Por qué |
+|---|---|---|
+| 1 | `pid <= 1` | `os.kill(0, …)` señaliza el **grupo de procesos entero** del EDR; 1 es systemd |
+| 2 | Acción válida | Solo `freeze` y `kill` |
+| 3 | Autoprotección | El PID no puede ser el EDR ni ninguno de sus ancestros |
+| 4 | Hilo de kernel | No tiene espacio de usuario que señalizar |
+| 5 | Proceso protegido | Matar `sshd` durante un incidente te deja fuera de la máquina |
+| 6 | **Reutilización de PID** | El `starttime` capturado con el evento debe seguir coincidiendo. Sin identidad capturada, no se remedia |
+| 7 | Límite de tasa | Un bucle de alucinación no puede arrasar la máquina |
+
+La comprobación 6 es la más importante: entre que el sensor captura el evento y el modelo decide
+pasan decenas de segundos, tiempo de sobra para que el kernel recicle el PID. La identidad real de un
+proceso es el par `(pid, starttime)`, no el PID.
+
+**`EDR_MODE` viene en `dry-run` por defecto**: el sistema razona, decide y valida, pero no envía la
+señal. Para que actúe de verdad, `EDR_MODE=autonomous`.
 
 ---
 
@@ -122,9 +146,12 @@ curl -s http://example.com > /dev/null      # ejecución de proceso
 Y revisa la telemetría cruda:
 
 ```bash
-cat kernel_events.json    # eventos de módulos (últimos 30)
-cat execve_events.json    # ejecuciones de procesos (últimas 200)
+tail -f events.jsonl      # registro forense: una línea JSON por evento
 ```
+
+`events.jsonl` es append-only: nunca se reescribe. Los eventos vivos están en memoria, compartidos
+entre el hilo del sensor y las herramientas MCP bajo un lock; el fichero es solo el registro. Así una
+línea corrupta no invalida el resto y no hay ninguna carrera de escritura.
 
 ### Ejecutar componentes por separado (depuración)
 
@@ -136,8 +163,13 @@ sudo venv/bin/python3 forensic_mcp.py
 ### Tests
 
 ```bash
-pytest
+venv/bin/python3 -m pytest -q
 ```
+
+84 tests en unos 3 segundos. **Sin root, sin BCC y sin red**, a propósito: son para ejecutarlos
+constantemente mientras se desarrolla. Cubren el parseo de `/proc` (incluidos los `comm` patológicos
+como `(sd-pam)`), la concurrencia del almacén de eventos (20 hilos × 500 escrituras con lecturas
+simultáneas) y las siete salvaguardas de remediación.
 
 ---
 
@@ -165,7 +197,10 @@ problemas de resolución DNS en WSL2. Tanto `setup_db.py` como `db.py` usan APIs
 | `Ollama no responde` en el preflight | El contenedor no está levantado | `docker compose up -d` |
 | El modelo va lentísimo | Ollama cargó el modelo en CPU | `docker exec ollama ollama ps` debe decir 100% GPU. La RTX 5070 es Blackwell: necesita CUDA 12.8+ y driver de Windows ≥572 |
 | `from bcc import BPF` falla | Faltan los enlaces de BCC en el venv | Ver la nota de instalación arriba |
-| El LLM analiza siempre la misma alerta | Los eventos no se consumen de `kernel_events.json` | Limitación conocida; se resuelve en la fase 1 del plan de evolución |
+| El LLM analiza siempre la misma alerta | Los eventos no se confirmaban nunca | Resuelto: `ack_alerts` marca lo procesado. Revisa `sensor_stats()` |
+| El EDR decide MITIGATE pero no mata nada | Está en `dry-run`, el modo por defecto | `EDR_MODE=autonomous` para que actúe de verdad |
+| `[BLOQUEADO] pid_reused` al remediar | El PID ya pertenece a otro proceso | Nada que arreglar: es exactamente el comportamiento correcto |
+| `Supabase no disponible` al arrancar | Base de datos caída o proyecto gratuito pausado | El EDR sigue detectando y guarda en `detections_fallback.jsonl`. Reactívalo en el dashboard |
 
 ---
 
@@ -174,8 +209,14 @@ problemas de resolución DNS en WSL2. Tanto `setup_db.py` como `db.py` usan APIs
 ```
 forensic_mcp.py          Servidor MCP + sensores eBPF (requiere root)
 orchestrator.py          Cliente MCP + bucle de decisión con el LLM
-db.py                    Persistencia en Supabase
+db.py                    Persistencia en Supabase, con respaldo local
 setup_db.py              Creación de tablas (ejecutar una vez)
+edr/                     Núcleo: lógica pura, importable sin root ni BCC
+  config.py              Configuración desde el entorno
+  procinfo.py            Lectura de /proc e identidad (pid, starttime)
+  eventstore.py          Almacén de eventos thread-safe
+  safety.py              Salvaguardas de remediación y modos de operación
+tests/                   Suite sin root, sin BCC y sin red
 docker-compose.yml       Ollama con passthrough de GPU
 scripts/
   preflight.sh           Comprobaciones previas al arranque

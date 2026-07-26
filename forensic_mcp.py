@@ -1,13 +1,25 @@
-from bcc import BPF
+"""Servidor MCP con las herramientas forenses y los sensores eBPF.
+
+Se lanza como subproceso del orquestador, con sus mismos privilegios, y habla
+JSON-RPC por stdio.
+
+**Nada de este fichero debe escribir en stdout**: ese es el canal de framing del
+protocolo MCP. Todo el logging va a stderr a través de `log`.
+
+La carga del programa eBPF ocurre dentro de `start_sensors()`, no al importar el
+módulo. Es lo que permite `import forensic_mcp` sin root para poder testear.
+"""
+
 import json
 import logging
 import os
 import sys
 import threading
-from pathlib import Path
+
 from mcp.server.fastmcp import FastMCP
-from datetime import datetime
-import signal
+
+from edr import config, procinfo, safety
+from edr.eventstore import EventStore
 
 # El transporte stdio de MCP usa stdout para el framing JSON-RPC: cualquier
 # escritura libre ahí corrompe el protocolo. Todo el logging va a stderr.
@@ -20,11 +32,13 @@ log = logging.getLogger("forensic_mcp")
 
 mcp = FastMCP("Kernel_Forensic")
 
-# Rutas absolutas derivadas del propio fichero: el servidor funciona
-# independientemente del directorio desde el que se lance.
-BASE_DIR = Path(__file__).resolve().parent
-LOG_FILE = BASE_DIR / "kernel_events.json"
-EXECVE_LOG_FILE = BASE_DIR / "execve_events.json"
+# Almacén compartido entre el hilo de los sensores y el hilo de las herramientas.
+# Sustituye a los dos ficheros JSON que se reescribían enteros sin sincronización.
+STORE = EventStore(config.EVENTS_JSONL, cap=config.EVENT_CAP)
+
+# Handle del programa BPF. Lo rellena start_sensors().
+_bpf = None
+
 
 # ──────────────────────────────────────────────
 # MCP Tools
@@ -32,22 +46,33 @@ EXECVE_LOG_FILE = BASE_DIR / "execve_events.json"
 
 @mcp.tool()
 def get_kernel_alerts() -> str:
-    """Reads the last captured kernel module load events from the eBPF sensor."""
-    if not os.path.exists(LOG_FILE):
+    """Devuelve las alertas de carga de módulos del kernel aún sin procesar.
+
+    Solo entrega eventos no confirmados: una vez el orquestador llama a
+    `ack_alerts`, dejan de aparecer. Antes no había forma de consumirlos y la
+    misma alerta se reanalizaba indefinidamente.
+    """
+    eventos = STORE.pending(config.KIND_MODULE_LOAD, limit=30)
+    if not eventos:
         return "No security alerts for now."
-    with open(LOG_FILE, "r") as f:
-        try:
-            events = json.load(f)
-            if not events:
-                return "Empty."
-            return json.dumps(events, indent=2)
-        except Exception as e:
-            return f"[!] Error reading alerts file: {str(e)}"
+    return json.dumps(eventos, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+def ack_alerts(max_seq: int) -> str:
+    """Confirma como procesadas todas las alertas hasta `max_seq` inclusive.
+
+    La confirmación es explícita y monótona en vez de un borrado implícito: queda
+    registro de qué se procesó y cuándo, y una confirmación tardía no puede hacer
+    retroceder el puntero.
+    """
+    n = STORE.ack(max_seq)
+    return f"Confirmados {n} eventos hasta seq={max_seq}."
 
 
 @mcp.tool()
 def inspect_pid_resources(pid: int) -> str:
-    """Inspect the open file descriptors for a given PID via /proc/{pid}/fd."""
+    """Lista los descriptores de fichero abiertos por un PID vía /proc/{pid}/fd."""
     path = f"/proc/{pid}/fd"
     if not os.path.exists(path):
         return f"[!] Error: PID {pid} does not exist or cannot be accessed."
@@ -67,7 +92,7 @@ def inspect_pid_resources(pid: int) -> str:
 
 @mcp.tool()
 def inspect_pid_network(pid: int) -> str:
-    """List active TCP connections for a given PID by matching socket inodes."""
+    """Lista las conexiones TCP activas de un PID cruzando inodos de socket."""
     fd_path = f"/proc/{pid}/fd"
     if not os.path.exists(fd_path):
         return f"[!] Error: PID {pid} does not exist or cannot be accessed."
@@ -139,42 +164,39 @@ def inspect_pid_network(pid: int) -> str:
 
 @mcp.tool()
 def get_execve_events(pid: int) -> str:
-    """Return execve events (process executions) associated with a PID or any of its children."""
-    if not os.path.exists(EXECVE_LOG_FILE):
-        return "No execve events recorded yet."
-    with open(EXECVE_LOG_FILE, "r") as f:
-        try:
-            events = json.load(f)
-        except Exception as e:
-            return f"[!] Error reading execve log: {e}"
-
-    relevant = [e for e in events if e.get("pid") == pid or e.get("ppid") == pid]
-    if not relevant:
+    """Devuelve las ejecuciones asociadas a un PID o a sus hijos directos."""
+    eventos = [
+        e for e in STORE.query(kind=config.KIND_EXECVE, limit=0)
+        if e.get("pid") == pid or e.get("ppid") == pid
+    ]
+    if not eventos:
         return f"[-] No execve events found for PID {pid} or its children."
-    return json.dumps(relevant, indent=2)
+    return json.dumps(eventos[-50:], indent=2, ensure_ascii=False)
 
 
 @mcp.tool()
-def remediate_incident(pid: int, action: str = "kill") -> str:
+def remediate_incident(pid: int, action: str = "kill",
+                       expected_starttime: int | None = None,
+                       reason: str = "") -> str:
+    """Congela (SIGSTOP) o termina (SIGKILL) un proceso, con salvaguardas.
+
+    La remediación pasa por siete comprobaciones antes de enviar nada: PID
+    remediable, acción válida, autoprotección del EDR y sus ancestros, hilos de
+    kernel, procesos críticos protegidos, coincidencia de identidad contra la
+    reutilización de PID, y límite de tasa.
+
+    `expected_starttime` lo rellena el orquestador a partir del evento original,
+    nunca el modelo. Si no coincide con el valor actual, el PID pertenece ya a
+    otro proceso y la remediación se aborta.
     """
-    Terminate or pause a suspicious process.
-    Actions: 'freeze' (SIGSTOP) or 'kill' (SIGKILL).
-    """
-    try:
-        if action == "freeze":
-            os.kill(pid, signal.SIGSTOP)
-            return f"[!] Process {pid} frozen (SIGSTOP). Still in memory, cannot execute."
-        elif action == "kill":
-            os.kill(pid, signal.SIGKILL)
-            return f"[!] Process {pid} terminated (SIGKILL)."
-        else:
-            return "[!] Unknown action. Use 'freeze' or 'kill'."
-    except ProcessLookupError:
-        return f"[!] PID {pid} does not exist."
-    except PermissionError:
-        return f"[!] Insufficient permissions to act on PID {pid}. Are you root?"
-    except Exception as e:
-        return f"[!] Error: {str(e)}"
+    record = safety.remediate(pid, action, expected_starttime, reason)
+    return safety.describe(record)
+
+
+@mcp.tool()
+def sensor_stats() -> str:
+    """Contadores del almacén de eventos: útiles para diagnóstico y rendimiento."""
+    return json.dumps(STORE.stats(), indent=2)
 
 
 # ──────────────────────────────────────────────
@@ -232,75 +254,81 @@ TRACEPOINT_PROBE(syscalls, sys_enter_execve) {
 }
 """
 
-# ──────────────────────────────────────────────
-# BPF init and kprobe attachment
-# ──────────────────────────────────────────────
-
-b = BPF(text=ebpf_code)
-
-fnname_finit = b.get_syscall_fnname("finit_module")
-fnname_init  = b.get_syscall_fnname("init_module")
-b.attach_kprobe(event=fnname_finit, fn_name="kprobe_monitor")
-b.attach_kprobe(event=fnname_init,  fn_name="kprobe_monitor")
-
-log.info("Monitoring syscalls: %s, %s, syscalls:sys_enter_execve", fnname_finit, fnname_init)
-log.info("Sensor active. Waiting for events...")
-
 
 # ──────────────────────────────────────────────
 # Event callbacks
 # ──────────────────────────────────────────────
 
-def append_to_log(log_file, entry, cap=30):
-    records = []
-    if os.path.exists(log_file):
-        with open(log_file, "r") as f:
-            try:
-                records = json.load(f)
-            except json.JSONDecodeError:
-                records = []
-    records.append(entry)
-    if len(records) > cap:
-        records = records[-cap:]
-    with open(log_file, "w") as f:
-        json.dump(records, f, indent=4)
+def _decode(raw):
+    return raw.decode(errors="replace").strip("\x00")
 
 
 def procesar_evento(cpu, data, size):
-    evento = b["eventos"].event(data)
-    entry = {
-        "timestamp": datetime.now().strftime("%d-%m-%Y %H:%M:%S"),
-        "pid":       evento.pid,
-        "comando":   evento.command.decode(errors="replace").strip("\x00"),
-        "evento":    evento.message.decode(errors="replace").strip("\x00"),
-    }
-    append_to_log(LOG_FILE, entry, cap=30)
+    evento = _bpf["eventos"].event(data)
+    pid = evento.pid
+    STORE.append(
+        config.KIND_MODULE_LOAD,
+        pid=pid,
+        comm=_decode(evento.command),
+        # La identidad se captura AQUÍ, milisegundos después del evento, no
+        # cuando el modelo decide actuar decenas de segundos más tarde. Es lo que
+        # reduce la ventana de reutilización de PID de segundos a milisegundos.
+        # Si el proceso ya murió queda a None y la remediación se denegará.
+        starttime=procinfo.starttime(pid),
+        detail=_decode(evento.message),
+    )
 
 
 def procesar_exec_evento(cpu, data, size):
-    evento = b["exec_events"].event(data)
-    entry = {
-        "timestamp": datetime.now().strftime("%d-%m-%Y %H:%M:%S"),
-        "pid":       evento.pid,
-        "ppid":      evento.ppid,
-        "command":   evento.command.decode(errors="replace").strip("\x00"),
-        "filename":  evento.filename.decode(errors="replace").strip("\x00"),
-    }
-    append_to_log(EXECVE_LOG_FILE, entry, cap=200)
+    evento = _bpf["exec_events"].event(data)
+    pid = evento.pid
+    STORE.append(
+        config.KIND_EXECVE,
+        pid=pid,
+        ppid=evento.ppid,
+        comm=_decode(evento.command),
+        filename=_decode(evento.filename),
+        starttime=procinfo.starttime(pid),
+    )
 
 
 # ──────────────────────────────────────────────
-# Sensor thread — polls both perf buffers
+# Sensor startup
 # ──────────────────────────────────────────────
 
-def run_ebpf_sensor():
-    b["eventos"].open_perf_buffer(procesar_evento)
-    b["exec_events"].open_perf_buffer(procesar_exec_evento)
-    while True:
-        b.perf_buffer_poll()
+def start_sensors():
+    """Compila el programa eBPF, engancha las sondas y arranca el hilo de sondeo.
+
+    Está en una función y no en el nivel de módulo a propósito: cargar BPF al
+    importar exigía root y enganchaba sondas reales, lo que hacía imposible
+    testear o siquiera importar el módulo.
+    """
+    global _bpf
+    from bcc import BPF  # importado aquí para que el módulo se pueda importar sin BCC
+
+    _bpf = BPF(text=ebpf_code)
+
+    fnname_finit = _bpf.get_syscall_fnname("finit_module")
+    fnname_init = _bpf.get_syscall_fnname("init_module")
+    _bpf.attach_kprobe(event=fnname_finit, fn_name="kprobe_monitor")
+    _bpf.attach_kprobe(event=fnname_init, fn_name="kprobe_monitor")
+
+    log.info("Monitorizando: %s, %s, syscalls:sys_enter_execve", fnname_finit, fnname_init)
+    log.info("Modo de remediación: %s", config.EDR_MODE)
+    log.info("Registro de eventos: %s", config.EVENTS_JSONL)
+
+    def run():
+        _bpf["eventos"].open_perf_buffer(procesar_evento)
+        _bpf["exec_events"].open_perf_buffer(procesar_exec_evento)
+        while True:
+            _bpf.perf_buffer_poll()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    log.info("Sensor activo. Esperando eventos...")
+    return thread
 
 
 if __name__ == "__main__":
-    sensor_thread = threading.Thread(target=run_ebpf_sensor, daemon=True)
-    sensor_thread.start()
+    start_sensors()
     mcp.run()
