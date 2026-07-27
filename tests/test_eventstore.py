@@ -174,6 +174,42 @@ def test_pending_devuelve_los_mas_antiguos_primero(tmp_path):
     assert [e["pid"] for e in store.pending(limit=3)] == [0, 1, 2]
 
 
+def test_el_predicado_se_aplica_antes_del_recorte(tmp_path):
+    """Regresión: filtrar después del `limit` habría hecho inútil el disparador.
+
+    `pending` devuelve los MÁS ANTIGUOS, y la proporción real es de miles de
+    eventos irrelevantes por cada uno que interesa. Recortando primero, la ventana
+    se llenaría de ruido y el evento marcado —que es el último— quedaría fuera:
+    el sistema no escalaría nunca nada.
+    """
+    store = EventStore(tmp_path / "e.jsonl")
+    for i in range(100):
+        store.append("execve", pid=i, interesante=(i == 99))
+
+    pendientes = store.pending(limit=5, predicate=lambda e: e["interesante"])
+
+    assert [e["pid"] for e in pendientes] == [99]
+
+
+def test_sin_predicado_se_comporta_como_siempre(tmp_path):
+    store = EventStore(tmp_path / "e.jsonl")
+    for i in range(5):
+        store.append("module_load", pid=i)
+
+    assert len(store.pending(limit=5)) == 5
+
+
+def test_el_predicado_convive_con_el_filtro_por_tipo(tmp_path):
+    store = EventStore(tmp_path / "e.jsonl")
+    store.append("module_load", pid=1, malo=True)
+    store.append("execve", pid=2, malo=True)
+    store.append("execve", pid=3, malo=False)
+
+    pendientes = store.pending("execve", predicate=lambda e: e["malo"])
+
+    assert [e["pid"] for e in pendientes] == [2]
+
+
 def test_ack_es_monotono(tmp_path):
     """Un ack tardío o reintentado no puede hacer retroceder el puntero."""
     store = EventStore(tmp_path / "e.jsonl")

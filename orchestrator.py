@@ -72,6 +72,21 @@ def find_event_for_pid(events, pid):
     return None
 
 
+def process_name(event):
+    """Nombre del proceso al que se refiere un evento.
+
+    En una carga de módulo `comm` ES el proceso. En un execve todavía no: en ese
+    punto el kernel aún no ha cambiado el nombre, así que `comm` es el de quien
+    llama —viaja como `caller_comm` precisamente para no confundirlos— y el
+    programa que se está ejecutando es el de `filename`.
+    """
+    if not event:
+        return None
+    if event.get("filename"):
+        return os.path.basename(event["filename"])
+    return event.get("comm")
+
+
 async def ask(prompt, allowed_pids, allow_investigate=True):
     """Consulta al modelo y devuelve (Decision, LLMResult).
 
@@ -157,7 +172,7 @@ async def handle_alerts(session, alerts):
     # Correlacionar el PID decidido con SU evento: de ahí salen el nombre del
     # proceso y la identidad que impide actuar sobre un PID reciclado.
     event = find_event_for_pid(alerts, verdict.pid) if verdict.pid else None
-    process = event.get("comm") if event else None
+    process = process_name(event)
     expected_starttime = event.get("starttime") if event else None
 
     if verdict.pid is not None and db.was_recently_investigated(verdict.pid, process):
@@ -176,6 +191,11 @@ async def handle_alerts(session, alerts):
         latency_ms=result.latency_ms,
         tokens_in=result.tokens_in,
         tokens_out=result.tokens_out,
+        # Por qué escaló este evento, según las reglas deterministas. Guardarlo
+        # junto al veredicto es lo que permite comparar después qué decidió el
+        # modelo frente a lo que ya decía el triaje.
+        severity=event.get("severity") if event else None,
+        rules_fired=event.get("rules_fired") if event else None,
     )
 
     if verdict.action == decision.INVESTIGATE:
@@ -205,15 +225,34 @@ async def handle_alerts(session, alerts):
         print(f"[!] Veredicto inutilizable tras el reintento: {verdict.detail}")
 
 
-async def run_orchestrator():
-    # El servidor MCP se lanza con el mismo intérprete y los mismos privilegios
-    # que el orquestador. Antes se anteponía "sudo": si sudo pedía contraseña,
-    # el prompt se mezclaba con el canal stdio JSON-RPC y la sesión MCP moría
-    # sin ningún mensaje de error.
-    server_params = StdioServerParameters(
+def mcp_server_params():
+    """Parámetros de lanzamiento del servidor MCP.
+
+    El servidor se lanza con el mismo intérprete y los mismos privilegios que el
+    orquestador. Antes se anteponía "sudo": si sudo pedía contraseña, el prompt se
+    mezclaba con el canal stdio JSON-RPC y la sesión MCP moría sin ningún mensaje.
+
+    **`env` hay que pasarlo explícitamente.** Sin él, el SDK de MCP lanza el
+    servidor con `get_default_environment()`, que solo propaga HOME, LOGNAME,
+    PATH, SHELL, TERM y USER. `EDR_MODE` no está en esa lista, así que
+    `sudo EDR_MODE=autonomous ... orchestrator.py` dejaba al orquestador
+    anunciando modo autónomo mientras el subproceso —que es donde vive
+    `remediate_incident` y donde se envía la señal— seguía en dry-run. El sistema
+    nunca llegó a actuar de verdad, y el banner del orquestador decía lo
+    contrario.
+
+    Copiar el entorno no concede nada nuevo: el subproceso ya corre con el mismo
+    usuario y los mismos privilegios.
+    """
+    return StdioServerParameters(
         command=sys.executable,
         args=[str(BASE_DIR / "forensic_mcp.py")],
+        env=os.environ.copy(),
     )
+
+
+async def run_orchestrator():
+    server_params = mcp_server_params()
 
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:

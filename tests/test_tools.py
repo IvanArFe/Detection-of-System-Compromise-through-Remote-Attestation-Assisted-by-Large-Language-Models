@@ -68,6 +68,63 @@ def test_los_execve_no_contaminan_las_alertas_de_modulos(store):
     assert "No security alerts for now" in forensic_mcp.get_kernel_alerts()
 
 
+# ── Orden de las alertas por accionabilidad ────────────────────
+
+def test_lo_vivo_va_al_final_aunque_sea_menos_severo(store, live_process):
+    """Regresión de la primera ejecución autónoma.
+
+    Los eventos más severos son los de la cadena de un dropper —severidad 150—
+    que vive tres segundos, mientras el orquestador sondea cada veinte. El modelo
+    gastaba sus dos rondas pidiendo congelar procesos ya muertos.
+
+    El orden es ascendente a propósito: `render_events` conserva los ÚLTIMOS
+    eventos al recortar, y Ollama descarta la cabeza del prompt conservando la
+    cola. Lo accionable tiene que quedar al final para sobrevivir a ambos.
+    """
+    from edr import procinfo
+
+    vivo = live_process.pid
+    store.append(config.KIND_EXECVE, pid=999999, filename="/bin/bash",
+                 starttime=1, severity=150, rules_fired="downloader_to_shell")
+    store.append(config.KIND_EXECVE, pid=vivo, filename="/tmp/.x",
+                 starttime=procinfo.starttime(vivo), severity=70,
+                 rules_fired="hidden_binary")
+
+    eventos = json.loads(forensic_mcp.get_kernel_alerts())
+
+    assert [e["pid"] for e in eventos] == [999999, vivo]
+    assert eventos[-1]["alive"] is True
+    assert eventos[0]["alive"] is False
+
+
+def test_un_proceso_muerto_se_sigue_presentando(store):
+    """No se filtra: tiene valor forense y el modelo puede responder NOTHING."""
+    store.append(config.KIND_EXECVE, pid=999999, filename="/bin/bash",
+                 starttime=1, severity=150, rules_fired="downloader_to_shell")
+
+    eventos = json.loads(forensic_mcp.get_kernel_alerts())
+    assert len(eventos) == 1
+    assert eventos[0]["alive"] is False
+
+
+def test_entre_iguales_manda_la_severidad(store):
+    store.append(config.KIND_EXECVE, pid=999998, filename="/tmp/.a",
+                 starttime=1, severity=70, rules_fired="hidden_binary")
+    store.append(config.KIND_EXECVE, pid=999999, filename="/bin/bash",
+                 starttime=1, severity=150, rules_fired="downloader_to_shell")
+
+    eventos = json.loads(forensic_mcp.get_kernel_alerts())
+    assert [e["severity"] for e in eventos] == [70, 150]
+
+
+def test_anotar_no_ensucia_el_almacen(store):
+    """`alive` es del momento en que se sirve la alerta, no del evento."""
+    store.append(config.KIND_MODULE_LOAD, pid=999999, comm="modprobe", starttime=1)
+    forensic_mcp.get_kernel_alerts()
+
+    assert "alive" not in store.query()[0]
+
+
 # ── get_execve_events ──────────────────────────────────────────
 
 def test_execve_del_pid_y_de_sus_hijos(store):
@@ -160,6 +217,31 @@ def test_inspect_pid_resources_con_pid_inexistente():
 
 def test_inspect_pid_network_con_pid_inexistente():
     assert "does not exist" in forensic_mcp.inspect_pid_network(999999)
+
+
+def test_el_subproceso_mcp_hereda_el_entorno(monkeypatch):
+    """Regresión: `EDR_MODE=autonomous` no llegaba a quien envía la señal.
+
+    El SDK de MCP lanza el servidor con `get_default_environment()`, que solo
+    propaga HOME, LOGNAME, PATH, SHELL, TERM y USER. `remediate_incident` vive en
+    ese subproceso, así que el sistema anunciaba modo autónomo por el banner del
+    orquestador mientras seguía en dry-run donde de verdad importaba.
+    """
+    monkeypatch.setenv("EDR_MODE", "autonomous")
+
+    params = orchestrator.mcp_server_params()
+
+    assert params.env is not None, "sin env explícito el SDK recorta el entorno"
+    assert params.env.get("EDR_MODE") == "autonomous"
+
+
+def test_el_subproceso_mcp_usa_el_mismo_interprete():
+    """Anteponer sudo aquí rompía el canal stdio si pedía contraseña."""
+    import sys
+
+    params = orchestrator.mcp_server_params()
+    assert params.command == sys.executable
+    assert params.args[0].endswith("forensic_mcp.py")
 
 
 def test_parse_json_list_tolera_texto_de_error():

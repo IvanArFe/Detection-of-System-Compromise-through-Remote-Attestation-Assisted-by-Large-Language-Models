@@ -118,3 +118,12 @@ EVENT_CAP = int(os.environ.get("EDR_EVENT_CAP", "2000"))
 # Tipos de evento conocidos. Se amplía en las fases 3 y 4.
 KIND_MODULE_LOAD = "module_load"
 KIND_EXECVE = "execve"
+
+# ──────────────────────────────────────────────
+# Triaje (edr/triage.py)
+# ──────────────────────────────────────────────
+
+# Puntuación a partir de la cual un proceso se escala al modelo. Con las
+# ponderaciones actuales, una sola señal débil no basta y dos sí: es lo que evita
+# que el uso legítimo de /tmp inunde el prompt.
+TRIAGE_THRESHOLD = int(os.environ.get("EDR_TRIAGE_THRESHOLD", "50"))

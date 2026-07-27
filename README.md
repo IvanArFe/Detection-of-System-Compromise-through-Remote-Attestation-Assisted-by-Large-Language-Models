@@ -35,10 +35,12 @@ Tres capas que se comunican por MCP sobre transporte stdio:
 **Flujo de decisión:**
 
 1. Los kprobes de eBPF sobre `init_module` / `finit_module` capturan cargas de módulos de kernel.
-2. Un tracepoint sobre `sys_enter_execve` captura todas las ejecuciones de procesos.
+2. Un tracepoint sobre `sys_enter_execve` captura todas las ejecuciones de procesos, con su línea de
+   órdenes.
 3. Ambos callbacks añaden el evento al `EventStore`: en memoria bajo un lock, y como línea en
-   `events.jsonl` para el registro forense.
-4. El orquestador consulta `get_kernel_alerts` cada 20 segundos. **Solo recibe lo aún no confirmado.**
+   `events.jsonl` para el registro forense. Las ejecuciones se puntúan de paso con `edr/triage.py`.
+4. El orquestador consulta `get_kernel_alerts` cada 20 segundos: cargas de módulo y ejecuciones por
+   encima del umbral de triaje. **Solo recibe lo aún no confirmado.**
 5. La telemetría se sanea y se recorta antes de entrar en el prompt. El LLM responde en la **ronda 1**
    con `INVESTIGATE`, `MITIGATE` o `NOTHING`, por salida estructurada JSON o, en su defecto, por una
    línea `DECISION:` que se parsea anclada al final.
@@ -52,7 +54,7 @@ Tres capas que se comunican por MCP sobre transporte stdio:
 
 | Herramienta | Descripción |
 |---|---|
-| `get_kernel_alerts()` | Alertas de carga de módulos **aún sin confirmar** |
+| `get_kernel_alerts()` | Alertas **aún sin confirmar**: cargas de módulo y procesos escalados por el triaje |
 | `ack_alerts(max_seq)` | Marca como procesadas las alertas hasta `max_seq` |
 | `inspect_pid_resources(pid)` | Descriptores de fichero abiertos vía `/proc/{pid}/fd` |
 | `inspect_pid_network(pid)` | Conexiones TCP activas, cruzando inodos de socket con `/proc/{pid}/net/tcp` |
@@ -77,6 +79,47 @@ silencio.
 
 Si una sonda no se puede enganchar, se registra y **las demás siguen funcionando**. `sensor_stats()`
 declara con qué cobertura real se está ejecutando.
+
+El sensor de ejecuciones captura además la **línea de órdenes**. Sin ella, `curl` descargando un
+parche y `curl` descargando un script para tubarlo a un shell producen exactamente el mismo evento, y
+no hay forma —ni para una regla ni para el modelo— de distinguirlos.
+
+### Qué se le pregunta al modelo, y qué no
+
+Consultar al modelo por cada ejecución no es viable: en una sesión corta se midieron 3601, en su
+inmensa mayoría el editor sondeando `git` y Docker lanzando `runc`. Ahogarían el contexto y
+diluirían la señal entre ruido.
+
+`edr/triage.py` puntúa cada ejecución con reglas deterministas y **solo se escala lo que supera un
+umbral**:
+
+| Regla | Peso | Señal |
+|---|---|---|
+| `exec_from_world_writable` | 40 | Ejecución desde `/tmp`, `/var/tmp`, `/dev/shm`, `/run/shm` |
+| `hidden_binary` | 30 | El nombre del binario empieza por punto |
+| `pipe_to_shell` | 40 | La orden tuba su salida a un shell |
+| `downloader_to_shell` | 60 | `curl`/`wget` **y** tubería a un shell |
+| `download_from_public_ip` | 50 | Descarga desde una IP literal encaminable por internet |
+| `shell_net_redirect` | 60 | Shell redirigido a `/dev/tcp/` — la reverse shell canónica |
+| `netcat_exec` | 60 | `netcat` ejecutando un programa |
+
+Los pesos están calibrados para que **una sola señal débil no escale y dos sí**: ejecutar algo desde
+`/tmp` es corriente; ejecutar desde `/tmp` un binario cuyo nombre empieza por punto, no.
+
+Esta división del trabajo es el argumento central del diseño híbrido: lo objetivo y barato lo
+resuelve una regla, y el razonamiento caro se reserva para lo que ya ha dado motivos. El modelo
+recibe además el campo `rules_fired`, es decir, **por qué** se le pregunta por ese proceso y no por
+los otros miles, presentado explícitamente como indicio a verificar y no como prueba.
+
+**Las alertas se ordenan por lo que se puede hacer con ellas, no por severidad.** Cada una se anota
+con `alive`, y las que siguen vivas se presentan al final, que es lo que sobrevive tanto al recorte
+del presupuesto de contexto como al que hace Ollama descartando la cabeza del prompt.
+
+El motivo salió de la primera ejecución autónoma: los eventos más severos son los de la cadena de un
+dropper (`bash -c 'curl … | sh'`), que vive tres segundos mientras el sistema sondea cada veinte. El
+modelo gastaba sus dos rondas razonando sobre procesos ya muertos y pidiendo congelarlos. **Un
+proceso muerto no se puede remediar por muy grave que fuese.** Los muertos se siguen mostrando
+—tienen valor forense— pero el prompt advierte de que no se les puede enviar ninguna señal.
 
 ### Salvaguardas de respuesta
 
@@ -164,7 +207,7 @@ comprueba que los enlaces existan bajo `venv/lib/python3.13/site-packages/`.
 ```bash
 # 1. Verificar que todo está en su sitio
 bash scripts/preflight.sh
-sudo venv/bin/python3 scripts/check-bpf.py   # compila y carga el programa eBPF
+sudo venv/bin/python3 scripts/check_sensor.py # comprueba el sensor de punta a punta
 
 # 2. Levantar Ollama
 docker compose up -d
@@ -187,7 +230,17 @@ En otra terminal, con el orquestador corriendo:
 sudo modprobe tcrypt && sudo rmmod tcrypt   # carga de módulo con éxito
 sudo insmod /etc/hostname                   # intento fallido (-ENOEXEC), la kprobe dispara igual
 sudo modprobe dummy && sudo modprobe -r dummy
-curl -s http://example.com > /dev/null      # ejecución de proceso
+curl -s http://example.com > /dev/null      # ejecución corriente: no escala
+```
+
+Para ver el triaje trabajar, `scripts/demo_detection.sh` genera primero actividad corriente y luego
+dos comportamientos que sí superan el umbral: una descarga tubada a un shell, y un proceso de vida
+larga ejecutándose desde `/tmp` con el nombre oculto. Nada de lo que hace es dañino — la "amenaza" es
+`/bin/sleep` copiado con otro nombre, que basta porque el sistema decide a partir de **cómo** se
+ejecuta un proceso, no de lo que el binario haga por dentro.
+
+```bash
+bash scripts/demo_detection.sh
 ```
 
 Y revisa la telemetría cruda:
@@ -213,7 +266,7 @@ sudo venv/bin/python3 forensic_mcp.py
 venv/bin/python3 -m pytest -q
 ```
 
-209 tests en unos 4 segundos. **Sin root, sin BCC y sin red**, a propósito: son para ejecutarlos
+265 tests en unos 4 segundos. **Sin root, sin BCC y sin red**, a propósito: son para ejecutarlos
 constantemente mientras se desarrolla. Cubren el parseo de `/proc` (incluidos los `comm` patológicos
 como `(sd-pam)`), la concurrencia del almacén de eventos (20 hilos × 500 escrituras con lecturas
 simultáneas), las salvaguardas de remediación, y la interpretación del veredicto del modelo —
@@ -268,10 +321,12 @@ edr/                     Núcleo: lógica pura, importable sin root ni BCC
   prompts.py             Sanitización y presupuesto de contexto
   decision.py            Interpretación del veredicto (estructurada + parser)
   netinfo.py             Decodificación de /proc/net/tcp e IPv6
+  triage.py              Reglas deterministas: qué merece consultarle al modelo
 tests/                   Suite sin root, sin BCC y sin red
 docker-compose.yml       Ollama con passthrough de GPU
 scripts/
   preflight.sh           Comprobaciones previas al arranque
-  check-bpf.py           Compila y carga el programa eBPF (requiere root)
+  check_sensor.py        Comprueba el sensor de punta a punta (requiere root)
+  demo_detection.sh      Genera la actividad de la demostración
   install-docker-wsl.sh  Docker Engine + NVIDIA Container Toolkit en WSL2
 ```

@@ -107,17 +107,29 @@ class EventStore:
             ]
         return matches[-limit:] if limit and limit > 0 else matches
 
-    def pending(self, kind=None, limit=50):
+    def pending(self, kind=None, limit=50, predicate=None):
         """Eventos aún no confirmados, del más antiguo al más reciente.
 
         Aquí el orden importa al revés que en `query`: se devuelven los más
         ANTIGUOS para que la confirmación avance de forma contigua y no queden
         huecos sin procesar entre medias.
+
+        `predicate` es un invocable que decide si un evento cuenta, y se aplica
+        **antes** del recorte por `limit`. El orden no es un detalle: como se
+        devuelven los más antiguos, con miles de eventos irrelevantes por delante
+        —que es exactamente la proporción real de los execve— filtrar después del
+        recorte devolvería una ventana llena de ruido y dejaría fuera justo los
+        eventos que interesan.
+
+        El almacén no sabe nada de en qué consiste ser interesante: recibe la
+        decisión ya tomada desde fuera.
         """
         with self._lock:
             matches = [
                 e for e in self._events
-                if e["seq"] > self._acked and (kind is None or e["kind"] == kind)
+                if e["seq"] > self._acked
+                and (kind is None or e["kind"] == kind)
+                and (predicate is None or predicate(e))
             ]
         return matches[:limit] if limit and limit > 0 else matches
 

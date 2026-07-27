@@ -191,20 +191,63 @@ Replace <PID> with the PID under investigation. Do not invent a PID."""
 
 
 def round1(alerts):
-    """Prompt de la ronda 1. Devuelve (texto, pids_permitidos)."""
+    """Prompt de la ronda 1. Devuelve (texto, pids_permitidos).
+
+    La tarea se describe según lo que hay REALMENTE en el lote. Cuando las alertas
+    solo podían ser cargas de módulo, el texto podía darlo por supuesto; desde que
+    el triaje escala también procesos, dar por supuesto que hay un módulo de por
+    medio manda al modelo a buscar algo que no está, y a razonar sobre su ausencia.
+
+    Los eventos escalados por el triaje llegan además con `rules_fired`, que es la
+    razón objetiva por la que se está preguntando por ese proceso y no por los
+    otros miles. Merece la pena decirle explícitamente qué es ese campo: si no,
+    tiende a interpretarlo como una acusación ya probada en vez de como un indicio.
+    """
     allowed = {e["pid"] for e in alerts if isinstance(e.get("pid"), int)}
     body = _cap_section(render_events(alerts, config.MAX_ALERTS))
 
+    kinds = {e.get("kind") for e in alerts}
+    hay_modulos = config.KIND_MODULE_LOAD in kinds
+    hay_procesos = config.KIND_EXECVE in kinds
+
+    pistas = []
+    if hay_modulos:
+        pistas.append(
+            "- Kernel module loads: loading by modprobe, insmod or systemd-udevd\n"
+            "  during normal system activity is usually legitimate. Loading by an\n"
+            "  unexpected process is not.")
+    if hay_procesos:
+        pistas.append(
+            "- Process executions: these were selected by deterministic rules, not\n"
+            "  at random. The `rules_fired` field states which suspicious traits were\n"
+            "  matched, and `severity` how strongly. Treat them as a starting point\n"
+            "  to verify, not as proof: a rule can match legitimate activity.")
+
+    # Sin decirlo, el modelo pide congelar procesos que ya no existen: en la
+    # primera ejecución autónoma lo hizo en los dos ciclos. La salvaguarda lo
+    # deniega, así que es inofensivo, pero gasta las dos rondas y falsea las
+    # métricas de decisión — un MITIGATE imposible no es lo mismo que un acierto.
+    if any(e.get("alive") is False for e in alerts):
+        pistas.append(
+            "- `alive: false` means the process has already exited. It CANNOT be\n"
+            "  frozen or killed, so MITIGATE on it has no effect. Report NOTHING\n"
+            "  for those, and act only on processes that are still alive.")
+
+    titulo = "SECURITY EVENTS FLAGGED ON THIS HOST"
+    if hay_modulos and not hay_procesos:
+        titulo = "KERNEL MODULE LOAD EVENTS"
+    elif hay_procesos and not hay_modulos:
+        titulo = "SUSPICIOUS PROCESS EXECUTIONS"
+
     prompt = f"""\
-KERNEL MODULE LOAD EVENTS
+{titulo}
 
 {wrap_untrusted(body)}
 
 TASK
-1. Identify which process loaded a kernel module and whether that is expected.
-2. Module loading by modprobe, insmod or systemd-udevd during normal system
-   activity is usually legitimate. Loading by an unexpected process is not.
-3. Choose one action:
+1. Decide whether the events above indicate a real threat on this host.
+{chr(10).join(pistas)}
+2. Choose one action:
    - INVESTIGATE: you need more context (open files, network, process tree)
    - MITIGATE: you are confident this is a threat and must act now
    - NOTHING: the behaviour looks legitimate
@@ -221,7 +264,7 @@ def round2(pid, alerts, resources, network, execve_events):
     desaparece primero es lo menos relevante.
     """
     body = "\n\n".join([
-        "== kernel module load events ==\n"
+        "== events that triggered this investigation ==\n"
         + _cap_section(render_events(alerts, config.MAX_ALERTS)),
         f"== open file descriptors of pid {pid} ==\n"
         + _cap_section(render_lines(resources, config.MAX_FDS)),
