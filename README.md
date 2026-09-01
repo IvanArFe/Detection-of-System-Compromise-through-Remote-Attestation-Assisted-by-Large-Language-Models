@@ -1,262 +1,288 @@
-# EDR autónomo con eBPF, MCP y LLM local
+# Autonomous EDR with eBPF, MCP and a local LLM
 
-Sistema de detección y respuesta en endpoint (EDR) que monitoriza el kernel de Linux con eBPF, expone
-herramientas forenses a un modelo de lenguaje mediante MCP, y deja que el modelo razone y decida la
-respuesta sin intervención humana.
+An endpoint detection and response system that watches the Linux kernel with eBPF, exposes forensic
+tools to a language model over MCP, and lets the model reason and decide the response without a
+person present.
 
-Trabajo de Fin de Grado.
+Final Degree Project.
 
 ---
 
-## Arquitectura
+## Architecture
 
-Tres capas que se comunican por MCP sobre transporte stdio:
+Three layers talking over MCP on a stdio transport:
 
 ```
 ┌─ forensic_mcp.py ──────────────┐      ┌─ orchestrator.py ─────────────────┐
-│  (proceso root)                │      │  (proceso root)                   │
+│  (root process)                │      │  (root process)                   │
 │                                │      │                                   │
-│  Hilos del sensor eBPF         │      │  Cliente MCP                      │
-│   kprobe init_module           │      │   → consulta alertas cada 20 s    │
-│   tracepoint sys_enter_execve  │      │   → sanea y presupuesta el prompt │
-│            │                   │ MCP  │   → consulta a Ollama             │
-│            ▼                   │stdio │   → interpreta el veredicto       │
-│      EventStore  ──────────────┼─────►│   → invoca herramientas MCP       │
-│   (memoria + events.jsonl)     │      │   → bucle de dos rondas           │
+│  eBPF sensor threads           │      │  MCP client                       │
+│   kprobe init_module           │      │   → polls alerts every 20 s       │
+│   tracepoint sys_enter_execve  │      │   → sanitises and budgets prompt  │
+│            │                   │ MCP  │   → queries Ollama                │
+│            ▼                   │stdio │   → interprets the verdict        │
+│      EventStore  ──────────────┼─────►│   → calls MCP tools               │
+│   (memory + events.jsonl)      │      │   → two-round loop                │
 │                                │      │                                   │
-│  Servidor FastMCP              │      │   → confirma con ack_alerts       │
-│   herramientas forenses ───────┼──────┤   → persiste en Supabase          │
+│  FastMCP server                │      │   → confirms with ack_alerts      │
+│   forensic tools ──────────────┼──────┤   → persists to Supabase          │
 └────────────────────────────────┘      └───────────────────────────────────┘
                                                         │
                                                         ▼
-                                              Ollama (contenedor, GPU)
+                                              Ollama (container, GPU)
 ```
 
-**Flujo de decisión:**
+**Decision flow:**
 
-1. Los kprobes de eBPF sobre `init_module` / `finit_module` capturan cargas de módulos de kernel.
-2. Un tracepoint sobre `sys_enter_execve` captura todas las ejecuciones de procesos, con su línea de
-   órdenes.
-3. Ambos callbacks añaden el evento al `EventStore`: en memoria bajo un lock, y como línea en
-   `events.jsonl` para el registro forense. Las ejecuciones se puntúan de paso con `edr/triage.py`.
-4. El orquestador consulta `get_kernel_alerts` cada 20 segundos: cargas de módulo y ejecuciones por
-   encima del umbral de triaje. **Solo recibe lo aún no confirmado.**
-5. La telemetría se sanea y se recorta antes de entrar en el prompt. El LLM responde en la **ronda 1**
-   con `INVESTIGATE`, `MITIGATE` o `NOTHING`, por salida estructurada JSON o, en su defecto, por una
-   línea `DECISION:` que se parsea anclada al final.
-6. Si es `INVESTIGATE`, se recopila evidencia forense (descriptores, conexiones, ejecuciones del
-   proceso y sus hijos) y se envía en la **ronda 2** para el veredicto final.
-7. Si es `MITIGATE`, se invoca `remediate_incident` con el `starttime` del evento original, que pasa
-   por las siete salvaguardas antes de señalizar nada.
-8. `ack_alerts` cierra el ciclo para que esas alertas no se reanalicen.
+1. eBPF kprobes on `init_module` / `finit_module` capture kernel module loads.
+2. A tracepoint on `sys_enter_execve` captures every process execution, with its command line.
+3. Both callbacks push the event into the `EventStore`: in memory under a lock, and as a line in
+   `events.jsonl` for the forensic record. Executions are scored on the way in by `edr/triage.py`.
+4. The orchestrator calls `get_kernel_alerts` every 20 seconds and gets module loads plus executions
+   above the triage threshold. **Only what has not been acknowledged comes back.**
+5. The telemetry is sanitised and trimmed before it enters the prompt. The LLM answers in **round 1**
+   with `INVESTIGATE`, `MITIGATE` or `NOTHING`, through structured JSON output or, failing that,
+   through a `DECISION:` line parsed anchored from the end.
+6. On `INVESTIGATE`, forensic evidence is gathered (descriptors, connections, executions of the
+   process and its children) and sent in **round 2** for the final verdict.
+7. On `MITIGATE`, `remediate_incident` is called with the `starttime` of the original event, and it
+   passes the nine safeguards before anything is signalled.
+8. `ack_alerts` closes the cycle so those alerts are not analysed again.
 
-### Herramientas MCP
+### MCP tools
 
-| Herramienta | Descripción |
+| Tool | Description |
 |---|---|
-| `get_kernel_alerts()` | Alertas **aún sin confirmar**: cargas de módulo y procesos escalados por el triaje |
-| `ack_alerts(max_seq)` | Marca como procesadas las alertas hasta `max_seq` |
-| `inspect_pid_resources(pid)` | Descriptores de fichero abiertos vía `/proc/{pid}/fd` |
-| `inspect_pid_network(pid)` | Conexiones TCP activas, cruzando inodos de socket con `/proc/{pid}/net/tcp` |
-| `get_execve_events(pid)` | Ejecuciones del PID o de sus hijos directos |
-| `remediate_incident(pid, action, expected_starttime, reason)` | Congela (`SIGSTOP`) o termina (`SIGKILL`) un proceso, tras siete validaciones |
-| `sensor_stats()` | Contadores de eventos, descartes y cobertura real de sondas |
+| `get_kernel_alerts()` | Alerts **not yet acknowledged**: module loads and processes the triage escalated |
+| `ack_alerts(max_seq)` | Marks alerts up to `max_seq` as consumed |
+| `inspect_pid_resources(pid)` | Open file descriptors through `/proc/{pid}/fd` |
+| `inspect_pid_network(pid)` | Active TCP connections, matching socket inodes against `/proc/{pid}/net/tcp` |
+| `get_execve_events(pid)` | Executions of that PID or of its direct children |
+| `remediate_incident(pid, action, expected_starttime, reason)` | Freezes (`SIGSTOP`) or terminates (`SIGKILL`) a process, after nine checks |
+| `sensor_stats()` | Event counters, losses and the coverage actually achieved |
 
-### Telemetría
+### Telemetry
 
-Todos los sensores emiten una **cabecera común** (`ts`, identidad, `cgroup_id`, `pid`, `ppid`, `uid`,
-`comm`) embebida al principio de su propia estructura, sobre un **único ring buffer**. Un solo buffer
-da ordenación global entre tipos de evento y hace menos copias que uno por sensor.
+Every sensor emits a **common header** (`ts`, identity, `cgroup_id`, `pid`, `ppid`, `uid`, `comm`)
+embedded at the start of its own structure, over a **single ring buffer**. One buffer gives global
+ordering between event types and copies less than one buffer per sensor would.
 
-La identidad del proceso se lee **dentro de la sonda**, no en el callback de userspace. Es la única
-forma de obtenerla: el callback corre cientos de milisegundos después y para entonces los procesos de
-vida corta ya no existen — se midieron 0 identidades capturadas sobre 2905 eventos con el enfoque
-anterior.
+Process identity is read **inside the probe**, not in the user-space callback. It is the only way to
+get it: the callback runs hundreds of milliseconds later, and by then short-lived processes are gone.
+The previous approach captured 0 identities over 2905 events.
 
-Las pérdidas se cuentan por separado en dos puntos: `ringbuf_dropped` cuando el kernel descarta por
-buffer lleno, y `dropped` cuando el almacén en memoria alcanza su tope. Antes se perdían eventos en
-silencio.
+Losses are counted separately at two points: `ringbuf_dropped` when the kernel discards because the
+buffer is full, and `dropped` when the in-memory store reaches its cap. Events used to be lost in
+silence.
 
-Si una sonda no se puede enganchar, se registra y **las demás siguen funcionando**. `sensor_stats()`
-declara con qué cobertura real se está ejecutando.
+If a probe cannot be attached, it is logged and **the rest keep working**. `sensor_stats()` declares
+the coverage the run actually achieved.
 
-El sensor de ejecuciones captura además la **línea de órdenes**. Sin ella, `curl` descargando un
-parche y `curl` descargando un script para tubarlo a un shell producen exactamente el mismo evento, y
-no hay forma —ni para una regla ni para el modelo— de distinguirlos.
+The execution sensor also captures the **command line**. Without it, `curl` fetching a patch and
+`curl` fetching a script to pipe into a shell produce exactly the same event, and neither a rule nor
+the model has any way to tell them apart.
 
-### Qué se le pregunta al modelo, y qué no
+### What the model is asked, and what it is not
 
-Consultar al modelo por cada ejecución no es viable: en una sesión corta se midieron 3601, en su
-inmensa mayoría el editor sondeando `git` y Docker lanzando `runc`. Ahogarían el contexto y
-diluirían la señal entre ruido.
+Consulting the model on every execution is not viable. A short session measured 3601 of them, the
+vast majority the editor polling `git` and Docker launching `runc`. They would drown the context and
+dilute the signal in noise.
 
-`edr/triage.py` puntúa cada ejecución con reglas deterministas y **solo se escala lo que supera un
-umbral**:
+`edr/triage.py` scores each execution with deterministic rules, and **only what passes a threshold is
+escalated**:
 
-| Regla | Peso | Señal |
+| Rule | Weight | Signal |
 |---|---|---|
-| `exec_from_world_writable` | 40 | Ejecución desde `/tmp`, `/var/tmp`, `/dev/shm`, `/run/shm` |
-| `hidden_binary` | 30 | El nombre del binario empieza por punto |
-| `pipe_to_shell` | 40 | La orden tuba su salida a un shell |
-| `downloader_to_shell` | 60 | `curl`/`wget` **y** tubería a un shell |
-| `download_from_public_ip` | 50 | Descarga desde una IP literal encaminable por internet |
-| `shell_net_redirect` | 60 | Shell redirigido a `/dev/tcp/` — la reverse shell canónica |
-| `netcat_exec` | 60 | `netcat` ejecutando un programa |
+| `exec_from_world_writable` | 40 | Execution from `/tmp`, `/var/tmp`, `/dev/shm`, `/run/shm` |
+| `hidden_binary` | 30 | The binary name begins with a dot |
+| `pipe_to_shell` | 40 | The command pipes its output into a shell |
+| `downloader_to_shell` | 60 | `curl`/`wget` **and** a pipe into a shell |
+| `download_from_public_ip` | 50 | Download from a literal address routable on the internet |
+| `shell_net_redirect` | 60 | Shell redirected to `/dev/tcp/`, the canonical reverse shell |
+| `netcat_exec` | 60 | `netcat` executing a program |
 
-Los pesos están calibrados para que **una sola señal débil no escale y dos sí**: ejecutar algo desde
-`/tmp` es corriente; ejecutar desde `/tmp` un binario cuyo nombre empieza por punto, no.
+The weights are calibrated so that **one weak signal does not escalate and two do**. Running
+something from `/tmp` is ordinary; running from `/tmp` a binary whose name begins with a dot is not.
 
-Esta división del trabajo es el argumento central del diseño híbrido: lo objetivo y barato lo
-resuelve una regla, y el razonamiento caro se reserva para lo que ya ha dado motivos. El modelo
-recibe además el campo `rules_fired`, es decir, **por qué** se le pregunta por ese proceso y no por
-los otros miles, presentado explícitamente como indicio a verificar y no como prueba.
+That division of labour is the central argument of the hybrid design: a rule settles what is cheap
+and objective, and the expensive reasoning is kept for what has already given grounds. The model also
+receives the `rules_fired` field, which tells it **why** it is being asked about that process and not
+about the other thousands, presented explicitly as an indication to verify and not as proof.
 
-**Las alertas se ordenan por lo que se puede hacer con ellas, no por severidad.** Cada una se anota
-con `alive`, y las que siguen vivas se presentan al final, que es lo que sobrevive tanto al recorte
-del presupuesto de contexto como al que hace Ollama descartando la cabeza del prompt.
+**Alerts are ordered by what can still be done about them, not by severity.** Each one is annotated
+with `alive`, and the ones still running are placed last, which is what survives both the context
+budget trim and the one Ollama performs by discarding the head of the prompt.
 
-El motivo salió de la primera ejecución autónoma: los eventos más severos son los de la cadena de un
-dropper (`bash -c 'curl … | sh'`), que vive tres segundos mientras el sistema sondea cada veinte. El
-modelo gastaba sus dos rondas razonando sobre procesos ya muertos y pidiendo congelarlos. **Un
-proceso muerto no se puede remediar por muy grave que fuese.** Los muertos se siguen mostrando
-—tienen valor forense— pero el prompt advierte de que no se les puede enviar ninguna señal.
+The reason came from the first autonomous run. The most severe events belong to a dropper chain
+(`bash -c 'curl … | sh'`) that lives three seconds while the system polls every twenty. The model
+spent both of its rounds reasoning about processes that were already dead, and asked to freeze them.
+**A dead process cannot be remediated however grave it was.** Dead alerts are still shown, since they
+carry forensic value, but the prompt warns that no signal can be sent to them.
 
-### Salvaguardas de respuesta
+### Response safeguards
 
-La respuesta autónoma no es incondicional. Antes de enviar ninguna señal,
-`edr/safety.py` evalúa siete comprobaciones en orden:
+The autonomous response is not unconditional. Before any signal is sent, `edr/safety.py` evaluates
+**nine checks in order** and returns on the first that fails. Each produces a stable, machine-readable
+`reason`, because they are aggregated in the laboratory statistics:
 
-| # | Comprobación | Por qué |
-|---|---|---|
-| 1 | `pid <= 1` | `os.kill(0, …)` señaliza el **grupo de procesos entero** del EDR; 1 es systemd |
-| 2 | Acción válida | Solo `freeze` y `kill` |
-| 3 | Autoprotección | El PID no puede ser el EDR ni ninguno de sus ancestros |
-| 4 | Hilo de kernel | No tiene espacio de usuario que señalizar |
-| 5 | Proceso protegido | Matar `sshd` durante un incidente te deja fuera de la máquina |
-| 6 | **Reutilización de PID** | El `starttime` capturado con el evento debe seguir coincidiendo. Sin identidad capturada, no se remedia |
-| 7 | Límite de tasa | Un bucle de alucinación no puede arrasar la máquina |
+| # | Check | `reason` | Why |
+|---|---|---|---|
+| 1 | Remediable PID | `invalid_pid` | `os.kill(0, …)` signals the EDR's **whole process group**; negatives signal arbitrary groups; 1 is systemd |
+| 2 | Valid action | `invalid_action` | Only `freeze` and `kill` |
+| 3 | The process exists | `no_such_process` | First read of `/proc`; everything else depends on it |
+| 4 | Self-protection | `self_protection` | The PID cannot be the EDR nor any of its ancestors |
+| 5 | Kernel thread | `kernel_thread` | It has no user space to signal |
+| 6 | Protected process | `protected_process` | Killing `sshd` during an incident locks you out of the machine |
+| 7 | **Known identity** | `identity_unknown` | With no captured `starttime` there is no remediation: it fails closed |
+| 8 | **Matching identity** | `pid_reused` | The `starttime` of the event has to still be the same |
+| 9 | Rate limit | `rate_limited` | 3 every 5 min: a hallucination loop cannot sweep the machine |
 
-La comprobación 6 es la más importante: entre que el sensor captura el evento y el modelo decide
-pasan decenas de segundos, tiempo de sobra para que el kernel recicle el PID. La identidad real de un
-proceso es el par `(pid, starttime)`, no el PID.
+Checks 7 and 8 are the core. Tens of seconds pass between the sensor capturing the event and the
+model deciding, which is time enough for the kernel to recycle the PID. **The real identity of a
+process is the pair `(pid, starttime)`, not the PID.**
 
-**`EDR_MODE` viene en `dry-run` por defecto**: el sistema razona, decide y valida, pero no envía la
-señal. Para que actúe de verdad, `EDR_MODE=autonomous`.
+The rate limit goes **last on purpose**: a rejected proposal should not consume remediation budget.
+And **every attempt is recorded, denials included**, because without that trace there is no way to
+show the safeguards fired.
 
-### Robustez de la decisión
+**`EDR_MODE` defaults to `dry-run`**: the system reasons, decides and validates, but sends no signal.
+For it to act for real, `EDR_MODE=autonomous`.
 
-El veredicto del modelo no se toma al pie de la letra. Se lee por dos vías, en orden de preferencia:
-la **salida estructurada nativa** de Ollama con un JSON Schema, y como respaldo un **parser anclado**
-que recorre las líneas de abajo arriba exigiendo que la línea entera sea el veredicto.
+### Robustness of the decision
 
-Tres defensas se refuerzan entre sí:
+The model's verdict is not taken at face value. It is read two ways, in order of preference: the
+**native structured output** of Ollama with a JSON Schema, and as a fallback an **anchored parser**
+that walks the lines from the bottom up requiring the whole line to be the verdict.
 
-| Defensa | Ataque que corta |
+Three defences reinforce one another:
+
+| Defence | Attack it cuts |
 |---|---|
-| `fullmatch` sobre la línea completa, de abajo arriba | Una frase que *menciona* o *niega* un veredicto deja de contar |
-| Ejemplos con el literal `pid=<PID>` | El modelo repite las instrucciones y el eco no es accionable |
-| `allowed_pids` sacado de la telemetría mostrada | Un PID alucinado o inyectado se rechaza |
+| `fullmatch` on the whole line, bottom-up | A sentence that *mentions* or *negates* a verdict stops counting |
+| Examples with the literal `pid=<PID>` | The model repeats the instructions and the echo is not actionable |
+| `allowed_pids` derived from the telemetry shown | A hallucinated or injected PID is rejected |
 
-Además, todo dato controlable por el atacante (`comm`, rutas, argumentos) se sanea antes de entrar en
-el prompt y la evidencia va encapsulada entre delimitadores marcados explícitamente como dato no
-confiable.
+On top of that, everything an attacker controls (`comm`, paths, arguments) is sanitised before it
+enters the prompt, and the evidence is wrapped between delimiters marked explicitly as untrusted data.
 
-**`INVALID` no es lo mismo que `NOTHING`.** Antes ambos colapsaban, así que "el modelo no supo
-responder" era indistinguible de "el modelo decidió no actuar" — cosas muy distintas al calcular
-falsos negativos.
+**`INVALID` is not the same as `NOTHING`.** They used to collapse together, so "the model could not
+answer" was indistinguishable from "the model chose not to act", which are very different things when
+computing false negatives.
 
 ---
 
-## Requisitos
+## Requirements
 
-- Debian sobre WSL2, kernel 6.6+ con soporte eBPF
-- Python 3.13 (venv en `./venv`)
-- BCC como paquete del sistema (`python3-bpfcc`) — **no se instala con pip**
-- Docker Engine dentro de WSL2, con NVIDIA Container Toolkit para el passthrough de la GPU
-- Una cuenta de Supabase (persistencia de detecciones y evidencia)
+- Debian on WSL2, kernel 6.6+ with eBPF support
+- Python 3.13 (venv in `./venv`)
+- BCC as a system package (`python3-bpfcc`) — **it does not install with pip**
+- Docker Engine inside WSL2, with the NVIDIA Container Toolkit for GPU passthrough
+- A Supabase account, for persisting detections and evidence
 
-### Instalación
+### Installation
 
 ```bash
-# 1. Dependencias del sistema
+# 1. System dependencies
 sudo apt install python3-bpfcc
 
-# 2. Docker Engine + NVIDIA Container Toolkit dentro de WSL2
+# 2. Docker Engine + NVIDIA Container Toolkit inside WSL2
 sudo bash scripts/install-docker-wsl.sh
 
-# 3. Entorno de Python
+# 3. Python environment
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
-# 4. Credenciales
-cp .env.example .env    # rellenar SUPABASE_URL, SUPABASE_KEY, SUPABASE_ACCESS_TOKEN
+# 4. Credentials
+cp .env.example .env    # fill in SUPABASE_URL, SUPABASE_KEY, SUPABASE_ACCESS_TOKEN
 
-# 5. Crear las tablas en Supabase (solo la primera vez)
+# 5. Create the Supabase tables (first time only)
 python setup_db.py
 ```
 
-**BCC dentro del venv:** BCC no se puede instalar con pip. La solución adoptada es enlazar las
-bibliotecas del sistema al `site-packages` del venv. Si `from bcc import BPF` falla dentro del venv,
-comprueba que los enlaces existan bajo `venv/lib/python3.13/site-packages/`.
+**BCC inside the venv:** BCC cannot be installed with pip. The approach taken is to link the system
+libraries into the venv's `site-packages`. If `from bcc import BPF` fails inside the venv, check that
+the links exist under `venv/lib/python3.13/site-packages/`.
 
 ---
 
-## Arranque
+## Running it
 
 ```bash
-# 1. Verificar que todo está en su sitio
+# 1. Check everything is in place
 bash scripts/preflight.sh
-sudo venv/bin/python3 scripts/check_sensor.py # comprueba el sensor de punta a punta
+sudo venv/bin/python3 scripts/check_sensor.py # checks the sensor end to end
 
-# 2. Levantar Ollama
+# 2. Bring Ollama up
 docker compose up -d
-docker exec ollama ollama pull llama3.1:8b     # solo la primera vez
+docker exec ollama ollama pull llama3.1:8b     # first time only
 
-# 3. Arrancar el sistema completo
+# 3. Start the whole system
 sudo venv/bin/python3 orchestrator.py
 ```
 
-El orquestador lanza `forensic_mcp.py` automáticamente como subproceso MCP, con el mismo intérprete y
-los mismos privilegios. No hace falta arrancarlo por separado.
+The orchestrator launches `forensic_mcp.py` itself as an MCP subprocess, with the same interpreter
+and the same privileges. There is no need to start it separately.
 
-Gracias a las rutas absolutas, **el sistema funciona desde cualquier directorio**.
+Because every path derives from the base directory, **the system runs from any directory**.
 
-### Generar eventos de prueba
+### Configuration
 
-En otra terminal, con el orquestador corriendo:
+Everything tunable is read from the environment with a default, in `edr/config.py`. These are the ones
+actually worth touching; the full list is 26 and lives in that file.
+
+| Variable | Default | What it changes |
+|---|---|---|
+| `EDR_MODE` | `dry-run` | `autonomous` so that signals are really sent |
+| `EDR_TRIAGE_THRESHOLD` | `50` | Score above which an execution is escalated to the model |
+| `EDR_MODEL` | `llama3.1:8b` | The model answering the queries |
+| `OLLAMA_URL` | `http://localhost:11434` | Where Ollama listens |
+| `EDR_RATE_LIMIT_MAX` | `3` | Remediations allowed per window |
+| `EDR_RATE_LIMIT_WINDOW` | `300` | Length of that window, in seconds |
+| `EDR_EVENT_CAP` | `2000` | Events the in-memory store holds |
+| `EDR_LLM_NUM_CTX` | `8192` | Context requested from Ollama |
+| `EDR_EVENTS_FILE` | `events.jsonl` | Where the forensic record is written |
+| `EDR_RUN_ID` | empty | Tags a campaign and turns on the journal under `results/` |
+
+They can go in front of the command for a single run, or in `.env` to persist. Watch out with the
+second: `.env` does not end in a newline, so append with `printf '\nVAR=value\n' >> .env` or the new
+variable will be glued onto the previous one.
+
+### Generating test events
+
+In another terminal, with the orchestrator running:
 
 ```bash
-sudo modprobe tcrypt && sudo rmmod tcrypt   # carga de módulo con éxito
-sudo insmod /etc/hostname                   # intento fallido (-ENOEXEC), la kprobe dispara igual
+sudo modprobe tcrypt && sudo rmmod tcrypt   # successful module load
+sudo insmod /etc/hostname                   # failed attempt (-ENOEXEC), the kprobe still fires
 sudo modprobe dummy && sudo modprobe -r dummy
-curl -s http://example.com > /dev/null      # ejecución corriente: no escala
+curl -s http://example.com > /dev/null      # ordinary execution: does not escalate
 ```
 
-Para ver el triaje trabajar, `scripts/demo_detection.sh` genera primero actividad corriente y luego
-dos comportamientos que sí superan el umbral: una descarga tubada a un shell, y un proceso de vida
-larga ejecutándose desde `/tmp` con el nombre oculto. Nada de lo que hace es dañino — la "amenaza" es
-`/bin/sleep` copiado con otro nombre, que basta porque el sistema decide a partir de **cómo** se
-ejecuta un proceso, no de lo que el binario haga por dentro.
+To watch the triage work, `scripts/demo_detection.sh` first generates ordinary activity and then two
+behaviours that do pass the threshold: a download piped into a shell, and a long-lived process running
+from `/tmp` under a hidden name. Nothing it does is harmful. The "threat" is `/bin/sleep` copied under
+another name, which is enough because the system decides from **how** a process was started and not
+from what the binary does inside.
 
 ```bash
 bash scripts/demo_detection.sh
 ```
 
-Y revisa la telemetría cruda:
+And look at the raw telemetry:
 
 ```bash
-tail -f events.jsonl      # registro forense: una línea JSON por evento
+tail -f events.jsonl      # forensic record: one JSON line per event
 ```
 
-`events.jsonl` es append-only: nunca se reescribe. Los eventos vivos están en memoria, compartidos
-entre el hilo del sensor y las herramientas MCP bajo un lock; el fichero es solo el registro. Así una
-línea corrupta no invalida el resto y no hay ninguna carrera de escritura.
+`events.jsonl` is append-only and never rewritten. The live events are in memory, shared between the
+sensor thread and the MCP tools under a lock, and the file is only the record. That way a corrupted
+line invalidates nothing else and there is no write to race over.
 
-### Ejecutar componentes por separado (depuración)
+### Running components separately (debugging)
 
 ```bash
-# Solo el servidor MCP y los sensores. Habla JSON-RPC por stdin: útil con un inspector MCP.
+# Only the MCP server and the sensors. Speaks JSON-RPC on stdin: useful with an MCP inspector.
 sudo venv/bin/python3 forensic_mcp.py
 ```
 
@@ -266,67 +292,132 @@ sudo venv/bin/python3 forensic_mcp.py
 venv/bin/python3 -m pytest -q
 ```
 
-265 tests en unos 4 segundos. **Sin root, sin BCC y sin red**, a propósito: son para ejecutarlos
-constantemente mientras se desarrolla. Cubren el parseo de `/proc` (incluidos los `comm` patológicos
-como `(sd-pam)`), la concurrencia del almacén de eventos (20 hilos × 500 escrituras con lecturas
-simultáneas), las salvaguardas de remediación, y la interpretación del veredicto del modelo —
-incluidas las inyecciones de prompt y el eco de las instrucciones.
+313 tests in about 4 seconds. **No root, no BCC and no network**, on purpose: they are meant to be run
+constantly while developing. They cover `/proc` parsing (including pathological `comm` values such as
+`(sd-pam)`), the concurrency of the event store (20 threads × 500 writes with simultaneous reads), the
+remediation safeguards, the interpretation of the model's verdict — prompt injections and instruction
+echoes included — and the contract that binds each laboratory scenario to the rules it claims to fire.
+
+### Reproducing the evaluation
+
+The figures in the report were not copied by hand from any terminal. They are produced by
+`scripts/lab/`, and every table in the results chapter comes out of one of these programs.
+
+| Instrument | What it does |
+|---|---|
+| `scenarios.py` | The catalogue: what each scenario runs, the score expected and the verdict that is correct |
+| `workload.py` | Generates reproducible host activity, from a fixed seed, to measure over |
+| `triage_replay.py` | Re-scores already recorded telemetry with the current rules |
+| `safeguards_matrix.py` | Provokes each safeguard individually against a real process |
+| `overhead.py` | Cost per execution, cost per event and the saturation point |
+| `run_lab.py` | Runs the scenario campaign, one orchestrator per repetition |
+| `lab_report.py` | Aggregates the runs into the tables of the report |
+
+The catalogue is a Python list and not a configuration file on purpose, so that the tests can check
+that each scenario scores exactly what it declares. One that misdescribes what it fires breaks the
+suite instead of producing a misleading result.
+
+```bash
+# Safeguards and cost: independent of everything else.
+sudo venv/bin/python3 scripts/lab/safeguards_matrix.py --out results/safeguards.md
+sudo venv/bin/python3 scripts/lab/overhead.py --out results/overhead.md
+
+# Telemetry: the sensor records while the generator produces the activity.
+sudo EDR_EVENTS_FILE=results/telemetry-clean.jsonl venv/bin/python3 forensic_mcp.py
+venv/bin/python3 scripts/lab/workload.py --minutes 20 --seed 1
+
+# The triage replayed over what was just recorded.
+venv/bin/python3 scripts/lab/triage_replay.py results/telemetry-clean.jsonl \
+     --out results/triage-clean.md
+
+# The scenario campaign and its report.
+sudo venv/bin/python3 scripts/lab/run_lab.py --mode autonomous --repeat 5
+venv/bin/python3 scripts/lab/lab_report.py --run-id <run_id>
+```
+
+The sensor in the third block runs in another terminal and has to stay alive while the generator
+works. `run_lab.py` starts one orchestrator per scenario and repetition, so the rate limiter's budget
+resets between them and one repetition cannot poison the next.
 
 ---
 
-## Persistencia en Supabase
+## Supabase persistence
 
-Implementada en `db.py`, invocada desde el orquestador en tres puntos del ciclo de decisión.
+Implemented in `db.py`, called from the orchestrator at three points of the decision cycle.
 
-**Tablas** (creadas por `setup_db.py` mediante la Management API sobre HTTPS):
+**Tables** (created by `setup_db.py` through the Management API over HTTPS):
 
-- **`detections`** — una fila por ciclo de decisión del LLM: `pid`, `process`, `decision`, `action`,
-  `llm_round1`, `llm_round2`, `remediation`.
-- **`evidence`** — resultados de las herramientas forenses, ligados a una detección:
-  `detection_id` (FK), `tool`, `result`.
+- **`detections`** — one row per LLM decision cycle. The core is `pid`, `process`, `decision`,
+  `action`, `llm_round1`, `llm_round2` and `remediation`. To that are added the metrics of each call
+  to the model (`model`, `latency_ms`, `tokens_in`, `tokens_out`) and the columns the laboratory uses
+  (`severity`, `mitre_technique`, `rules_fired`, `run_id`, `scenario`).
+- **`evidence`** — results of the forensic tools, linked to a detection: `detection_id` (FK), `tool`,
+  `result`.
 
-**Nota sobre WSL2:** las conexiones directas a PostgreSQL en `db.*.supabase.co:5432` fallan por
-problemas de resolución DNS en WSL2. Tanto `setup_db.py` como `db.py` usan APIs HTTPS para evitarlo.
+`pid` and `process` are nullable on purpose: a `NOTHING` verdict carries no PID, and those rows are
+exactly the ones the false-negative rate is computed from. There are indices on `(pid, process,
+created_at)` for the deduplication query, which used to scan the whole table on every cycle.
+
+`setup_db.py` is idempotent. Run it again whenever the schema changes: it creates what is missing and
+leaves alone what already exists.
+
+When `EDR_RUN_ID` is set, every detection is also written to `results/<run_id>/detections.jsonl`. The
+laboratory report reads from there and not from Supabase, so that a database that is down or a free
+project that has been paused cannot invalidate a campaign.
+
+**A note on WSL2:** direct PostgreSQL connections to `db.*.supabase.co:5432` fail because of how WSL2
+resolves names. Both `setup_db.py` and `db.py` use HTTPS APIs to avoid it.
 
 ---
 
-## Problemas frecuentes
+## Common problems
 
-| Síntoma | Causa | Solución |
+| Symptom | Cause | Fix |
 |---|---|---|
-| La sesión MCP se cuelga sin mensaje | `sudo` pidiendo contraseña dentro del canal stdio | Ya resuelto: el servidor se lanza con `sys.executable`. Si reaparece, ejecuta `sudo -v` antes |
-| `Ollama no responde` en el preflight | El contenedor no está levantado | `docker compose up -d` |
-| El modelo va lentísimo | Ollama cargó el modelo en CPU | `docker exec ollama ollama ps` debe decir 100% GPU. La RTX 5070 es Blackwell: necesita CUDA 12.8+ y driver de Windows ≥572 |
-| `from bcc import BPF` falla | Faltan los enlaces de BCC en el venv | Ver la nota de instalación arriba |
-| El LLM analiza siempre la misma alerta | Los eventos no se confirmaban nunca | Resuelto: `ack_alerts` marca lo procesado. Revisa `sensor_stats()` |
-| El EDR decide MITIGATE pero no mata nada | Está en `dry-run`, el modo por defecto | `EDR_MODE=autonomous` para que actúe de verdad |
-| `[BLOQUEADO] pid_reused` al remediar | El PID ya pertenece a otro proceso | Nada que arreglar: es exactamente el comportamiento correcto |
-| `Supabase no disponible` al arrancar | Base de datos caída o proyecto gratuito pausado | El EDR sigue detectando y guarda en `detections_fallback.jsonl`. Reactívalo en el dashboard |
+| The MCP session hangs with no message | `sudo` asking for a password inside the stdio channel | Already resolved: the server is launched with `sys.executable`. If it comes back, run `sudo -v` first |
+| `Ollama does not respond` in the preflight | The container is not up | `docker compose up -d` |
+| The model is extremely slow | Ollama loaded the model on the CPU | `docker exec ollama ollama ps` has to say 100% GPU. The RTX 5070 is Blackwell: it needs CUDA 12.8+ and a Windows driver ≥572 |
+| `from bcc import BPF` fails | The BCC links are missing from the venv | See the installation note above |
+| The LLM keeps analysing the same alert | The events were never acknowledged | Resolved: `ack_alerts` marks what has been consumed. Check `sensor_stats()` |
+| The EDR decides MITIGATE but kills nothing | It is in `dry-run`, the default mode | `EDR_MODE=autonomous` for it to act for real |
+| `[BLOCKED] pid_reused` when remediating | The PID already belongs to another process | Nothing to fix: this is exactly the correct behaviour |
+| `Supabase unavailable` at startup | Database down or free project paused | The EDR keeps detecting and writes to `detections_fallback.jsonl`. Reactivate it in the dashboard |
 
 ---
 
-## Estructura del repositorio
+## Repository layout
 
 ```
-forensic_mcp.py          Servidor MCP + sensores eBPF (requiere root)
-orchestrator.py          Cliente MCP + bucle de decisión con el LLM
-db.py                    Persistencia en Supabase, con respaldo local
-setup_db.py              Creación de tablas (ejecutar una vez)
-edr/                     Núcleo: lógica pura, importable sin root ni BCC
-  config.py              Configuración desde el entorno
-  procinfo.py            Lectura de /proc e identidad (pid, starttime)
-  eventstore.py          Almacén de eventos thread-safe
-  safety.py              Salvaguardas de remediación y modos de operación
-  llm.py                 Cliente de Ollama con timeout, options y métricas
-  prompts.py             Sanitización y presupuesto de contexto
-  decision.py            Interpretación del veredicto (estructurada + parser)
-  netinfo.py             Decodificación de /proc/net/tcp e IPv6
-  triage.py              Reglas deterministas: qué merece consultarle al modelo
-tests/                   Suite sin root, sin BCC y sin red
-docker-compose.yml       Ollama con passthrough de GPU
+forensic_mcp.py          MCP server + eBPF sensors (needs root)
+orchestrator.py          MCP client + decision loop with the LLM
+db.py                    Supabase persistence, with a local fallback
+setup_db.py              Table creation (run once)
+edr/                     Core: pure logic, importable without root or BCC
+  config.py              Configuration from the environment
+  procinfo.py            /proc reading and identity (pid, starttime)
+  eventstore.py          Thread-safe event store
+  safety.py              Remediation safeguards and operating modes
+  llm.py                 Ollama client with timeout, options and metrics
+  prompts.py             Sanitisation and context budgeting
+  decision.py            Verdict interpretation (structured + parser)
+  netinfo.py             /proc/net/tcp and IPv6 decoding
+  triage.py              Deterministic rules: what is worth asking the model
+tests/                   Suite with no root, no BCC and no network
+  data/                  Fixtures for the laboratory report
+docker-compose.yml       Ollama with GPU passthrough
+requirements.txt         Python dependencies
+.env.example             Credentials template
 scripts/
-  preflight.sh           Comprobaciones previas al arranque
-  check_sensor.py        Comprueba el sensor de punta a punta (requiere root)
-  demo_detection.sh      Genera la actividad de la demostración
-  install-docker-wsl.sh  Docker Engine + NVIDIA Container Toolkit en WSL2
+  preflight.sh           Checks to run before starting
+  check_sensor.py        Checks the sensor end to end (needs root)
+  demo_detection.sh      Generates the demonstration activity
+  install-docker-wsl.sh  Docker Engine + NVIDIA Container Toolkit on WSL2
+  lab/                   Evaluation instruments: they produce the report's tables
+    scenarios.py         Scenario catalogue, with expected score and verdict
+    workload.py          Reproducible host activity, from a fixed seed
+    triage_replay.py     Replays the triage over recorded telemetry
+    safeguards_matrix.py Provokes each safeguard separately
+    overhead.py          Cost per execution, per event and saturation point
+    run_lab.py           Runs the scenario campaign
+    lab_report.py        Aggregates the runs into tables
 ```

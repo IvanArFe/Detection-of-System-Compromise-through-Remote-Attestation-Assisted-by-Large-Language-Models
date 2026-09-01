@@ -1,6 +1,6 @@
-"""Núcleo del EDR: lógica pura, testeable sin root, sin BCC y sin red.
+"""EDR core: pure logic, testable without root, without BCC and without network.
 
-Los entrypoints (`forensic_mcp.py`, `orchestrator.py`) importan de aquí. Nada de
-este paquete debe importar `bcc` ni cargar programas eBPF al importarse: ésa es
-justamente la razón de que exista.
+The entrypoints (`forensic_mcp.py`, `orchestrator.py`) import from here. Nothing
+in this package may import `bcc` or load eBPF at import time — that is the whole
+point of it.
 """

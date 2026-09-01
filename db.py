@@ -1,23 +1,20 @@
-"""Persistencia de detecciones y evidencia en Supabase.
+"""Detection and evidence persistence in Supabase.
 
-**Principio de diseño de este módulo: la persistencia es telemetría, no una
-dependencia de la detección.** Que la base de datos remota esté caída no puede
-detener el EDR.
+**Persistence is telemetry, not a dependency of detection.** A remote database
+being down must not stop the EDR: every operation degrades to a local JSONL and
+the decision loop carries on.
 
-No es una precaución teórica. El 26/07/2026, durante la verificación de la Fase 0,
-este módulo tumbó el orquestador entero dos veces en el mismo día por dos causas
-distintas: un `httpx.ConnectError` transitorio tras reconfigurarse la red al
-instalar Docker, y un `521` de Cloudflare porque el proyecto gratuito de Supabase
-se había auto-pausado tras meses inactivo. Ninguna de las dos tiene nada que ver
-con la capacidad de detectar amenazas, y ambas dejaron el sistema muerto.
-
-Ahora cada operación degrada a un JSONL local y el ciclo de decisión continúa.
+This is not a theoretical precaution. This module brought the whole orchestrator
+down twice in one day — a transient connection error and a Cloudflare 521 from a
+free-tier project that had auto-paused — neither of which has anything to do with
+the ability to detect threats.
 """
 
 import json
 import logging
 import os
 import threading
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from supabase import create_client
@@ -41,10 +38,10 @@ def get_client():
 
 
 def _fallback(operation, payload):
-    """Registra localmente lo que no se pudo enviar a Supabase.
+    """Record locally whatever could not be sent to Supabase.
 
-    Es un JSONL append-only, igual que el registro de eventos: si más adelante hay
-    que reconstruir lo ocurrido durante una caída, la información está aquí.
+    Append-only JSONL, like the event log: if what happened during an outage
+    ever has to be reconstructed, it is here.
     """
     record = {
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -56,37 +53,61 @@ def _fallback(operation, payload):
             with open(config.DB_FALLBACK_JSONL, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
     except OSError as e:
-        log.error("tampoco se pudo escribir el respaldo local: %s", e)
+        log.error("could not write the local fallback either: %s", e)
+
+
+def _journal(operation, payload):
+    """Mirror a detection locally when the run is tagged with a run_id.
+
+    Unconditional, unlike `_fallback`: the lab report reads from here, so it must
+    not depend on whether the remote insert happened to succeed.
+    """
+    if not config.RUN_ID:
+        return
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "run_id": config.RUN_ID,
+        "scenario": config.SCENARIO or None,
+        "operation": operation,
+        "payload": payload,
+    }
+    try:
+        path = config.RESULTS_DIR / config.RUN_ID
+        path.mkdir(parents=True, exist_ok=True)
+        with _fallback_lock:
+            with open(path / "detections.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except OSError as e:
+        log.error("could not write the run journal: %s", e)
 
 
 def _warn_once(e):
-    """Avisa del primer fallo con detalle y de los siguientes de forma escueta.
+    """Warn in detail on the first failure and tersely afterwards.
 
-    El bucle consulta cada 20 s: sin esto, una caída prolongada de Supabase llena
-    la salida de trazas idénticas y esconde lo que sí importa.
+    The loop polls every 20 s: without this, a prolonged outage fills the output
+    with identical tracebacks and buries what matters.
     """
     global _client_failed
     if not _client_failed:
         _client_failed = True
-        log.warning("Supabase no disponible (%s: %s). Se continúa con respaldo local en %s. "
-                    "Si el proyecto es gratuito, comprueba que no esté pausado: "
+        log.warning("Supabase unavailable (%s: %s). Continuing with the local fallback at %s. "
+                    "On a free project, check it is not paused: "
                     "https://supabase.com/dashboard",
                     type(e).__name__, e, config.DB_FALLBACK_JSONL)
     else:
-        log.debug("Supabase sigue no disponible: %s", type(e).__name__)
+        log.debug("Supabase still unavailable: %s", type(e).__name__)
 
 
 def log_detection(pid, process, decision, action, llm_round1,
                   llm_round2=None, remediation=None, **extra):
-    """Inserta una detección. Devuelve su UUID, o None si no se pudo persistir.
+    """Insert a detection. Returns its UUID, or None if it could not be stored.
 
-    `extra` recoge las columnas añadidas para las fases 5-7 (`model`, `latency_ms`,
-    `tokens_in`, `tokens_out`, `severity`, `mitre_technique`…). Se aceptan como
-    kwargs para que añadir una métrica nueva no obligue a cambiar esta firma.
+    `extra` carries the phase 5-7 columns (`model`, `latency_ms`, `tokens_in`,
+    `severity`, `mitre_technique`…) as kwargs, so adding a metric does not mean
+    changing this signature.
 
-    `pid` y `process` pueden ser None: un veredicto NOTHING sin PID también se
-    registra, porque sin esas filas no se puede calcular la tasa de falsos
-    negativos.
+    `pid` and `process` may be None: a NOTHING verdict is recorded too, because
+    the false-negative rate is computed from exactly those rows.
     """
     row = {
         "pid": pid,
@@ -100,16 +121,22 @@ def log_detection(pid, process, decision, action, llm_round1,
     }
     try:
         res = get_client().table("detections").insert(row).execute()
-        return res.data[0]["id"]
-    except Exception as e:  # noqa: BLE001 — cualquier fallo debe degradar, no propagar
+        detection_id = res.data[0]["id"]
+    except Exception as e:  # noqa: BLE001 — any failure must degrade, not propagate
         _warn_once(e)
         _fallback("log_detection", row)
-        return None
+        # In the lab a local id is synthesised so the rest of the cycle still
+        # correlates in the journal. Outside it, None keeps the old behaviour.
+        detection_id = f"local-{uuid.uuid4()}" if config.RUN_ID else None
+
+    _journal("log_detection", {"id": detection_id, **row})
+    return detection_id
 
 
 def update_detection(detection_id, **fields):
     if not detection_id:
         return False
+    _journal("update_detection", {"id": detection_id, **fields})
     try:
         get_client().table("detections").update(fields).eq("id", detection_id).execute()
         return True
@@ -123,6 +150,7 @@ def log_evidence(detection_id, tool, result):
     if not detection_id:
         return False
     row = {"detection_id": detection_id, "tool": tool, "result": result}
+    _journal("log_evidence", row)
     try:
         get_client().table("evidence").insert(row).execute()
         return True
@@ -133,12 +161,11 @@ def log_evidence(detection_id, tool, result):
 
 
 def was_recently_investigated(pid, process, window_seconds=300):
-    """True si el mismo (pid, proceso) ya se analizó en la ventana indicada.
+    """True if the same (pid, process) was already analysed within the window.
 
-    **Ante un fallo devuelve False (fail-open).** La alternativa —asumir que ya se
-    investigó y no analizar— convertiría una caída de la base de datos en una
-    ceguera total del EDR. Analizar dos veces un incidente es un desperdicio;
-    no analizarlo es un fallo de seguridad.
+    **Fails open.** The alternative — assuming it was investigated and skipping
+    it — would turn a database outage into total blindness. Analysing an
+    incident twice is waste; not analysing it is a security failure.
     """
     cutoff = (datetime.now(timezone.utc) - timedelta(seconds=window_seconds)).isoformat()
     try:

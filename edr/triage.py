@@ -1,33 +1,12 @@
-"""Triaje determinista: decide qué eventos merecen molestar al modelo.
+"""Deterministic triage: decides which events are worth asking the model about.
 
-**El hueco que cierra.** Hasta ahora el bucle de decisión solo se disparaba con
-cargas de módulo: `get_kernel_alerts()` devolvía únicamente eventos
-`module_load`. El sensor de execve, que produce el 99 % de la telemetría, no
-iniciaba nunca un ciclo — solo aportaba evidencia en la ronda 2 de una
-investigación que ya estaba en marcha por otro motivo. Es decir, un proceso
-malicioso podía ejecutarse delante del EDR sin que éste llegara a preguntarse
-nada.
+Cheap objective facts are settled by a rule; expensive reasoning is reserved for
+what already looks suspicious. This is the minimal version of what phase 5 will
+be (rules + ATT&CK + host baseline).
 
-Lo evidente sería mandarle al modelo todos los execve. No sirve: en esta máquina
-se midieron 3601 en una sesión corta, la inmensa mayoría de VS Code sondeando
-`git` y de Docker lanzando `runc`. Ahogarían el prompt y el coste por ciclo, y
-sobre todo diluirían la señal entre ruido.
-
-De ahí este módulo: **reglas deterministas que puntúan, y un umbral que decide a
-quién se le pregunta al modelo**. Es la forma que tendrá la Fase 5 completa
-—reglas, ATT&CK y línea base del host—, aquí en su versión mínima. La división de
-trabajo es deliberada y es el argumento central del diseño híbrido: lo barato y
-objetivo lo resuelve una regla, y el razonamiento caro se reserva para lo que ya
-ha demostrado ser sospechoso.
-
-**Las ponderaciones están pensadas para que una sola señal débil no escale.**
-Ejecutar desde `/tmp` es común y legítimo; ejecutar desde `/tmp` un binario cuyo
-nombre empieza por punto, ya no. Dos señales débiles superan el umbral, una no.
-
-Los slugs de las reglas son estables y legibles por máquina, igual que los de
-`safety.py`: se agregan en las estadísticas del laboratorio y aparecen en la
-columna `rules_fired`, así que renombrarlos rompería la comparación entre
-ejecuciones.
+Rule slugs are stable and machine-readable, like the ones in safety.py: they are
+aggregated in the lab statistics and stored in the `rules_fired` column, so
+renaming one breaks the comparison between runs.
 """
 
 import ipaddress
@@ -37,28 +16,26 @@ import re
 from . import config
 
 # ──────────────────────────────────────────────
-# Ponderaciones
+# Weights
 # ──────────────────────────────────────────────
 
-# Directorios donde puede escribir cualquiera. Que un binario se ejecute desde
-# aquí no es malo por sí solo, pero sí es donde aterriza casi todo lo que se
-# descarga.
+# Anyone can write here. Not malicious by itself, but it is where almost
+# everything that gets downloaded lands.
 WORLD_WRITABLE = ("/tmp/", "/var/tmp/", "/dev/shm/", "/run/shm/")
 
 DOWNLOADERS = frozenset({"curl", "wget"})
 NETCATS = frozenset({"nc", "ncat", "netcat", "nc.traditional"})
 
-# La tubería a un shell tal cual aparece en la línea de órdenes. Solo se ve cuando
-# alguien invoca `sh -c "…"`, que es justamente como se ejecutan los droppers.
+# A pipe into a shell only shows up under `sh -c "…"`, which is exactly how real
+# droppers run: a normal shell consumes the `|` and never passes it in argv.
 _PIPE_TO_SHELL = re.compile(r"\|\s*(?:/[\w/]*/)?(?:ba|da|z|k|a)?sh\b")
 
-# Redirección de un shell a un socket: la forma canónica de una reverse shell en
-# bash sin herramientas externas.
+# Canonical reverse shell in bash without external tools.
 _NET_REDIRECT = re.compile(r"/dev/(?:tcp|udp)/")
 
 _URL = re.compile(r"https?://([^/\s:]+)")
 
-# Peso de cada regla. El umbral vive en config para poder moverlo sin tocar código.
+# The threshold itself lives in config so it can be moved without touching code.
 WEIGHTS = {
     "exec_from_world_writable": 40,
     "hidden_binary": 30,
@@ -71,30 +48,27 @@ WEIGHTS = {
 
 
 # ──────────────────────────────────────────────
-# Reglas
+# Rules
 # ──────────────────────────────────────────────
 
 def _is_public_ip(host):
-    """True si `host` es una IP literal y además encaminable por internet.
+    """True if `host` is a literal IP and globally routable.
 
-    Que la URL apunte a una IP en crudo en vez de a un dominio es la señal: el
-    software legítimo usa nombres. Pero hay que excluir loopback y redes privadas
-    o la regla se dispararía con la propia infraestructura — en esta máquina,
-    cualquier `curl http://127.0.0.1:11434/…` contra Ollama.
+    The routability check is what keeps the rule from firing on our own
+    infrastructure — every `curl http://127.0.0.1:11434/…` to Ollama.
     """
     try:
         ip = ipaddress.ip_address(host.strip("[]"))
     except ValueError:
-        return False   # es un dominio
+        return False   # it is a domain name
     return ip.is_global
 
 
 def assess(event):
-    """Puntúa un evento execve. Devuelve `(severidad, [slugs de reglas])`.
+    """Score an execve event. Returns `(severity, [rule slugs])`.
 
-    Función pura: no toca `/proc`, ni la red, ni el reloj. Eso la hace testeable
-    sin root y determinista, que es lo que permite defender por qué escaló cada
-    proceso en la memoria del trabajo.
+    Pure: no /proc, no network, no clock. That is what makes it testable without
+    root and what makes every escalation defensible after the fact.
     """
     filename = (event.get("filename") or "").strip()
     cmdline = (event.get("cmdline") or "").strip()
@@ -103,59 +77,56 @@ def assess(event):
         return 0, []
 
     base = os.path.basename(filename)
-    reglas = []
+    rules = []
 
     if filename.startswith(WORLD_WRITABLE):
-        reglas.append("exec_from_world_writable")
+        rules.append("exec_from_world_writable")
 
     if base.startswith(".") and base not in (".", ".."):
-        reglas.append("hidden_binary")
+        rules.append("hidden_binary")
 
-    hay_tuberia = bool(_PIPE_TO_SHELL.search(cmdline))
-    if hay_tuberia:
-        reglas.append("pipe_to_shell")
+    piped = bool(_PIPE_TO_SHELL.search(cmdline))
+    if piped:
+        rules.append("pipe_to_shell")
 
-    # Un descargador puede aparecer como el propio binario ejecutado o citado
-    # dentro de la orden de un `sh -c`, que es el caso habitual del dropper.
-    menciona_descargador = base in DOWNLOADERS or any(
+    # A downloader can be the executed binary itself or be quoted inside a
+    # `sh -c` command, which is the usual dropper shape.
+    downloader = base in DOWNLOADERS or any(
         re.search(rf"\b{d}\b", cmdline) for d in DOWNLOADERS)
 
-    if menciona_descargador and hay_tuberia:
-        reglas.append("downloader_to_shell")
+    if downloader and piped:
+        rules.append("downloader_to_shell")
 
-    if menciona_descargador:
+    if downloader:
         for host in _URL.findall(cmdline):
             if _is_public_ip(host):
-                reglas.append("download_from_public_ip")
+                rules.append("download_from_public_ip")
                 break
 
     if _NET_REDIRECT.search(cmdline):
-        reglas.append("shell_net_redirect")
+        rules.append("shell_net_redirect")
 
     if base in NETCATS and re.search(r"(?:^|\s)-\w*[ec]", cmdline):
-        reglas.append("netcat_exec")
+        rules.append("netcat_exec")
 
-    return sum(WEIGHTS[r] for r in reglas), reglas
+    return sum(WEIGHTS[r] for r in rules), rules
 
 
 def should_escalate(event, threshold=None):
-    """True si el evento merece consultarle al modelo."""
+    """True if the event is worth asking the model about."""
     threshold = config.TRIAGE_THRESHOLD if threshold is None else threshold
-    severidad, _ = assess(event)
-    return severidad >= threshold
+    severity, _ = assess(event)
+    return severity >= threshold
 
 
 def is_alert(event, threshold=None):
-    """True si el evento debe entrar en `get_kernel_alerts()`.
+    """True if the event belongs in `get_kernel_alerts()`.
 
-    Las cargas de módulo escalan siempre: son intrínsecamente privilegiadas, hay
-    pocas y son el caso que el sistema venía tratando desde el principio. Los
-    execve pasan por el triaje.
+    Module loads always escalate: they are inherently privileged and rare.
+    Execve events go through the triage.
     """
-    # Un proceso de otro namespace de PIDs no es interpretable ni remediable desde
-    # aquí: su número no corresponde a nada en nuestro /proc y no se le puede
-    # enviar una señal. Se conserva en el registro forense, pero escalarlo sería
-    # pedirle al modelo que decida sobre algo que el sistema no puede tocar.
+    # A process from another PID namespace cannot be interpreted or signalled
+    # from here. It is kept in the forensic record but never escalated.
     if event.get("foreign_ns"):
         return False
 
@@ -166,11 +137,10 @@ def is_alert(event, threshold=None):
 
     threshold = config.TRIAGE_THRESHOLD if threshold is None else threshold
 
-    # La severidad se calcula una sola vez, al recibir el evento, y viaja con él.
-    # Recalcularla en cada consulta significaría reevaluar miles de eventos en
-    # cada vuelta del bucle. El recálculo queda solo como red de seguridad para
-    # eventos que no hayan pasado por el sensor (tests, reproducciones).
-    severidad = event.get("severity")
-    if severidad is None:
-        severidad, _ = assess(event)
-    return severidad >= threshold
+    # Severity is computed once, on ingest, and travels with the event.
+    # Recomputing here would re-evaluate thousands of events every cycle; the
+    # fallback only covers events that never went through the sensor.
+    severity = event.get("severity")
+    if severity is None:
+        severity, _ = assess(event)
+    return severity >= threshold

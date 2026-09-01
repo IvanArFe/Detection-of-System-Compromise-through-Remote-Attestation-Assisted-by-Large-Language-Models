@@ -1,15 +1,9 @@
-"""Salvaguardas de remediación: lo que el EDR NO puede hacer.
+"""Remediation safeguards: what the EDR is not allowed to do.
 
-Hasta ahora `remediate_incident` hacía `os.kill(pid, SIGKILL)` sin una sola
-comprobación. Un modelo de 8B que alucina un PID, o un atacante que consigue
-inyectar texto en el prompt, podía ordenar la muerte de PID 1, del propio
-orquestador o del sensor.
-
-Este módulo es la capa determinista que acota lo probabilístico. El LLM propone;
-estas reglas disponen. Y **toda tentativa queda registrada, incluidas las
-denegadas y su motivo**: sin esa traza no se puede demostrar que las salvaguardas
-se activaron, y "el modelo propuso matar systemd y la capa de seguridad lo
-bloqueó" es un resultado, no un incidente.
+The deterministic layer that bounds the probabilistic one. The LLM proposes,
+these rules dispose. **Every attempt is recorded, denials included**: without
+that trace there is no way to show the safeguards fired, and "the model asked to
+kill systemd and the safety layer refused" is a result, not an incident.
 """
 
 import logging
@@ -26,19 +20,16 @@ log = logging.getLogger("edr.safety")
 
 Verdict = namedtuple("Verdict", ["allowed", "reason", "detail"])
 
-# Registro de tentativas para auditoría. Acotado: es una traza de diagnóstico, no
-# el almacén de evidencia (de eso se encarga la base de datos).
+# Bounded diagnostic trace, not the evidence store — that is the database.
 _ATTEMPTS = deque(maxlen=200)
 _ATTEMPTS_LOCK = threading.Lock()
 
 
 class RateLimiter:
-    """Ventana deslizante sobre las remediaciones aprobadas.
+    """Sliding window over approved remediations.
 
-    Existe para acotar el daño de un bucle de alucinación: si el modelo se
-    engancha proponiendo matar procesos, el límite corta antes de que arrase la
-    máquina. El reloj es inyectable para poder testear la ventana sin esperas
-    reales.
+    Bounds the damage of a hallucination loop. The clock is injectable so the
+    window can be tested without real waits.
     """
 
     def __init__(self, max_n=None, window_s=None, clock=time.monotonic):
@@ -69,94 +60,80 @@ class RateLimiter:
             self._hits.clear()
 
 
-# Limitador por defecto del proceso. Los tests crean el suyo propio.
+# Process-wide default. Tests build their own.
 _DEFAULT_LIMITER = RateLimiter()
 
 
 def validate_remediation(pid, action, expected_starttime=None,
                          self_pid=None, limiter=None):
-    """Decide si una remediación puede ejecutarse. No ejecuta nada.
+    """Decide whether a remediation may run. Executes nothing.
 
-    Devuelve un `Verdict(allowed, reason, detail)`. El `reason` es un identificador
-    estable pensado para agregarse en las estadísticas del laboratorio, no un
-    mensaje para humanos.
+    Returns a `Verdict(allowed, reason, detail)`. `reason` is a stable slug meant
+    to be aggregated in the lab statistics, not a message for humans.
     """
     limiter = _DEFAULT_LIMITER if limiter is None else limiter
     self_pid = os.getpid() if self_pid is None else self_pid
 
-    # 1. PIDs que no designan un proceso concreto.
-    #    Es la comprobación más importante de la lista: os.kill(0, sig) señaliza
-    #    al GRUPO DE PROCESOS ENTERO del EDR, que corre como root; los negativos
-    #    señalizan grupos arbitrarios; y 1 es systemd.
+    # os.kill(0, sig) signals the EDR's WHOLE process group, negatives signal
+    # arbitrary groups, and 1 is systemd.
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
-        return Verdict(False, "invalid_pid", f"pid={pid!r} no designa un proceso remediable")
+        return Verdict(False, "invalid_pid", f"pid={pid!r} is not a remediable process")
 
     if action not in config.VALID_ACTIONS:
         return Verdict(False, "invalid_action",
-                       f"acción {action!r}; permitidas: {list(config.VALID_ACTIONS)}")
+                       f"action {action!r}; allowed: {list(config.VALID_ACTIONS)}")
 
     stat = procinfo.read_stat(pid)
     if stat is None:
-        return Verdict(False, "no_such_process", f"el PID {pid} ya no existe")
+        return Verdict(False, "no_such_process", f"pid {pid} no longer exists")
 
-    # 3. Autoprotección. El servidor MCP es hijo del orquestador, así que recorrer
-    #    la cadena de ancestros cubre a ambos con una sola comprobación. Es el
-    #    equivalente a las self-protection rules de un EDR comercial.
+    # Self-protection. The MCP server is a child of the orchestrator, so walking
+    # the ancestor chain covers both.
     if pid == self_pid:
-        return Verdict(False, "self_protection", "el PID es el propio proceso del EDR")
+        return Verdict(False, "self_protection", "the pid is the EDR's own process")
     chain = procinfo.ancestors(self_pid)
     if pid in chain:
         return Verdict(False, "self_protection",
-                       f"el PID {pid} es un ancestro del EDR (cadena: {chain})")
+                       f"pid {pid} is an ancestor of the EDR (chain: {chain})")
 
     if stat["flags"] & procinfo.PF_KTHREAD:
         return Verdict(False, "kernel_thread",
-                       f"{stat['comm']} es un hilo de kernel, no tiene espacio de usuario")
+                       f"{stat['comm']} is a kernel thread, it has no userspace")
 
     if stat["comm"] in config.PROTECTED_COMMS:
         return Verdict(False, "protected_process",
-                       f"{stat['comm']} está en la lista de procesos protegidos")
+                       f"{stat['comm']} is on the protected process list")
 
-    # 6. Anti-reutilización de PID. Entre la captura del evento y este instante han
-    #    pasado decenas de segundos, tiempo de sobra para que el kernel reciclara
-    #    el PID y se lo diera a un proceso inocente. El `starttime` viaja con la
-    #    alerta desde la captura; si no coincide, no es el mismo proceso.
+    # Tens of seconds pass between capturing the event and this point: ample time
+    # for the kernel to recycle the pid onto an innocent process.
     #
-    #    Sin `starttime` NO se remedia. Podría parecer excesivo, pero la alternativa
-    #    es señalizar un PID cuya identidad no se ha podido establecer, que es
-    #    precisamente el fallo que esta comprobación existe para evitar: media
-    #    validación no vale de nada. Se descubrió en la verificación de la Fase 1,
-    #    donde el 100% de los eventos de carga de módulo llegaban sin identidad
-    #    porque `modprobe` muere antes de que el callback de userspace pueda leer
-    #    su /proc. La solución de fondo —capturar la identidad dentro de la propia
-    #    sonda eBPF— es de la Fase 3; hasta entonces, se falla en cerrado.
+    # Without a starttime there is NO remediation. Skipping the check would leave
+    # open exactly the door it exists to close — half an identity check is worth
+    # nothing — so it fails closed.
     if expected_starttime is None:
         return Verdict(False, "identity_unknown",
-                       f"no se capturó la identidad del PID {pid}: no se puede "
-                       f"verificar que siga siendo el mismo proceso")
+                       f"identity of pid {pid} was never captured: cannot verify "
+                       f"it is still the same process")
 
     if stat["starttime"] != expected_starttime:
         return Verdict(False, "pid_reused",
-                       f"starttime esperado {expected_starttime}, actual {stat['starttime']}: "
-                       f"el PID {pid} pertenece ahora a otro proceso ({stat['comm']})")
+                       f"expected starttime {expected_starttime}, actual {stat['starttime']}: "
+                       f"pid {pid} now belongs to another process ({stat['comm']})")
 
-    # 7. El límite de tasa va el último a propósito: una propuesta inválida no debe
-    #    consumir presupuesto de remediación.
+    # Checked last on purpose: a rejected proposal must not consume budget.
     if not limiter.would_allow():
         return Verdict(False, "rate_limited",
-                       f"más de {limiter.max_n} remediaciones en {limiter.window_s:.0f}s")
+                       f"more than {limiter.max_n} remediations in {limiter.window_s:.0f}s")
 
     return Verdict(True, "ok", f"{stat['comm']} (pid={pid}, starttime={stat['starttime']})")
 
 
 def remediate(pid, action, expected_starttime=None, reason="",
               mode=None, signal_fn=None, limiter=None, self_pid=None):
-    """Valida y, si procede y el modo lo permite, señaliza el proceso.
+    """Validate and, if allowed and the mode permits, signal the process.
 
-    En `dry-run` se recorre exactamente el mismo camino salvo el envío de la señal.
-    Eso es deliberado: para que las métricas del laboratorio en dry-run sean
-    comparables con las de autonomous, ambos modos deben tomar las mismas
-    decisiones y consumir el mismo presupuesto de remediación.
+    dry-run walks exactly the same path minus the signal, so its lab metrics stay
+    comparable with autonomous ones: same decisions, same rate-limit budget.
     """
     mode = config.EDR_MODE if mode is None else mode
     signal_fn = os.kill if signal_fn is None else signal_fn
@@ -179,7 +156,7 @@ def remediate(pid, action, expected_starttime=None, reason="",
     if not verdict.allowed:
         record["outcome"] = "denied"
         _remember(record)
-        log.warning("REMEDIACIÓN DENEGADA pid=%s action=%s motivo=%s (%s)",
+        log.warning("REMEDIATION DENIED pid=%s action=%s reason=%s (%s)",
                     pid, action, verdict.reason, verdict.detail)
         return record
 
@@ -188,7 +165,7 @@ def remediate(pid, action, expected_starttime=None, reason="",
     if mode == config.MODE_DRY_RUN:
         record["outcome"] = "dry_run"
         _remember(record)
-        log.info("[DRY-RUN] se habría enviado %s a %s — NO se envió ninguna señal",
+        log.info("[DRY-RUN] would have sent %s to %s — no signal was sent",
                  action.upper(), verdict.detail)
         return record
 
@@ -196,13 +173,13 @@ def remediate(pid, action, expected_starttime=None, reason="",
     try:
         signal_fn(pid, sig)
         record["outcome"] = "executed"
-        log.warning("REMEDIACIÓN EJECUTADA %s sobre %s", action.upper(), verdict.detail)
+        log.warning("REMEDIATION EXECUTED %s on %s", action.upper(), verdict.detail)
     except ProcessLookupError:
         record["outcome"] = "vanished"
-        record["detail"] = f"el PID {pid} murió entre la validación y la señal"
+        record["detail"] = f"pid {pid} died between validation and the signal"
     except PermissionError:
         record["outcome"] = "permission_denied"
-        record["detail"] = f"sin permisos para señalizar el PID {pid}: ¿se ejecuta como root?"
+        record["detail"] = f"not allowed to signal pid {pid}: running as root?"
     except OSError as e:
         record["outcome"] = "error"
         record["detail"] = str(e)
@@ -217,19 +194,19 @@ def _remember(record):
 
 
 def attempts():
-    """Todas las tentativas registradas, aprobadas y denegadas."""
+    """Every recorded attempt, approved and denied."""
     with _ATTEMPTS_LOCK:
         return list(_ATTEMPTS)
 
 
 def describe(record):
-    """Convierte el registro de una tentativa en una línea para el operador y el LLM."""
+    """Turn an attempt record into one line for the operator and the LLM."""
     if record["outcome"] == "denied":
-        return f"[BLOQUEADO] {record['verdict']}: {record['detail']}"
+        return f"[BLOCKED] {record['verdict']}: {record['detail']}"
     if record["outcome"] == "dry_run":
-        return (f"[DRY-RUN] validado ({record['detail']}). No se envió ninguna señal. "
-                f"Para actuar de verdad: EDR_MODE=autonomous")
+        return (f"[DRY-RUN] validated ({record['detail']}). No signal was sent. "
+                f"To act for real: EDR_MODE=autonomous")
     if record["outcome"] == "executed":
-        verb = "congelado (SIGSTOP)" if record["action"] == "freeze" else "terminado (SIGKILL)"
-        return f"[EJECUTADO] proceso {verb}: {record['detail']}"
+        verb = "frozen (SIGSTOP)" if record["action"] == "freeze" else "killed (SIGKILL)"
+        return f"[EXECUTED] process {verb}: {record['detail']}"
     return f"[{record['outcome'].upper()}] {record['detail']}"

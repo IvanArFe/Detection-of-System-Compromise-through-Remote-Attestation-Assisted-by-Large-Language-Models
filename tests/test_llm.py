@@ -1,8 +1,8 @@
-"""Tests del cliente de Ollama, sin red.
+"""Tests for the Ollama client, without network.
 
-`requests.post` se sustituye por un doble. Lo que se comprueba es que ningún modo
-de fallo escapa hacia el bucle de decisión: el cliente siempre devuelve un
-LLMResult, nunca lanza.
+`requests.post` is replaced by a double. What is checked is that no failure mode
+escapes into the decision loop: the client always returns an LLMResult and never
+raises.
 """
 
 import json
@@ -29,7 +29,7 @@ class FakeResponse:
 
 
 class FakeSession:
-    """Captura la petición y devuelve lo que se le indique."""
+    """Capture the request and return whatever it was given."""
 
     def __init__(self, response):
         self._response = response
@@ -49,146 +49,146 @@ OK_BODY = {
     "response": "  DECISION: NOTHING  ",
     "prompt_eval_count": 361,
     "eval_count": 42,
-    "total_duration": 3_500_000_000,   # 3,5 s en nanosegundos
+    "total_duration": 3_500_000_000,   # 3.5 s in nanoseconds
 }
 
 
-# ── Camino feliz y métricas ────────────────────────────────────
+# ── Happy path and metrics ─────────────────────────────────────
 
-def test_respuesta_correcta_y_metricas():
+def test_a_correct_response_and_its_metrics():
     s = FakeSession(FakeResponse(OK_BODY))
-    r = llm.ask_sync("hola", session=s)
+    r = llm.ask_sync("hello", session=s)
 
     assert r.ok
-    assert r.text == "DECISION: NOTHING"     # se recorta el espacio sobrante
+    assert r.text == "DECISION: NOTHING"     # surrounding whitespace trimmed
     assert (r.tokens_in, r.tokens_out) == (361, 42)
-    assert r.latency_ms == 3500              # ns → ms, para la columna latency_ms
+    assert r.latency_ms == 3500              # ns → ms, for the latency_ms column
     assert r.model == "llama3.1:8b"
 
 
-def test_se_envian_las_opciones_que_evitan_el_truncado():
+def test_the_options_that_prevent_truncation_are_sent():
     s = FakeSession(FakeResponse(OK_BODY))
-    llm.ask_sync("hola", session=s)
+    llm.ask_sync("hello", session=s)
 
-    opciones = s.last_json["options"]
-    assert opciones["num_ctx"] == config.LLM_NUM_CTX
-    assert opciones["num_ctx"] > 4096, "el contexto por defecto de Ollama se queda corto"
-    assert opciones["temperature"] == config.LLM_TEMPERATURE
+    options = s.last_json["options"]
+    assert options["num_ctx"] == config.LLM_NUM_CTX
+    assert options["num_ctx"] > 4096, "Ollama's default context is too small"
+    assert options["temperature"] == config.LLM_TEMPERATURE
     assert s.last_json["keep_alive"] == config.LLM_KEEP_ALIVE
 
 
-def test_siempre_se_envia_timeout():
-    """Sin timeout, un Ollama colgado cuelga el EDR para siempre."""
+def test_a_timeout_is_always_sent():
+    """Without one, a hung Ollama hangs the EDR forever."""
     s = FakeSession(FakeResponse(OK_BODY))
-    llm.ask_sync("hola", session=s)
+    llm.ask_sync("hello", session=s)
     assert s.last_timeout == (config.LLM_CONNECT_TIMEOUT, config.LLM_READ_TIMEOUT)
 
 
-# ── Modos de fallo ─────────────────────────────────────────────
+# ── Failure modes ──────────────────────────────────────────────
 
-def test_timeout_no_lanza():
-    r = llm.ask_sync("hola", session=FakeSession(requests.Timeout("agotado")))
+def test_a_timeout_does_not_raise():
+    r = llm.ask_sync("hello", session=FakeSession(requests.Timeout("expired")))
     assert not r.ok
-    assert "timeout" in r.error.lower()
+    assert "timed out" in r.error.lower()
 
 
-def test_conexion_rechazada_no_lanza():
-    r = llm.ask_sync("hola", session=FakeSession(
+def test_a_refused_connection_does_not_raise():
+    r = llm.ask_sync("hello", session=FakeSession(
         requests.ConnectionError("connection refused")))
     assert not r.ok
     assert "ConnectionError" in r.error
 
 
-def test_error_http_no_lanza():
-    r = llm.ask_sync("hola", session=FakeSession(FakeResponse({}, status=500)))
+def test_an_http_error_does_not_raise():
+    r = llm.ask_sync("hello", session=FakeSession(FakeResponse({}, status=500)))
     assert not r.ok
 
 
-def test_respuesta_que_no_es_json_no_lanza():
-    """Un proxy devolviendo HTML, por ejemplo. Es fallo de infraestructura."""
+def test_a_non_json_response_does_not_raise():
+    """A proxy returning HTML, say. That is an infrastructure failure."""
     s = FakeSession(FakeResponse(json.JSONDecodeError("no", "doc", 0)))
-    r = llm.ask_sync("hola", session=s)
+    r = llm.ask_sync("hello", session=s)
     assert not r.ok
     assert "JSON" in r.error
 
 
-def test_respuesta_vacia_se_marca_como_error():
+def test_an_empty_response_is_flagged_as_an_error():
     s = FakeSession(FakeResponse({"response": "   "}))
-    r = llm.ask_sync("hola", session=s)
+    r = llm.ask_sync("hello", session=s)
     assert not r.ok
 
 
-def test_sin_metricas_no_revienta():
-    s = FakeSession(FakeResponse({"response": "algo"}))
-    r = llm.ask_sync("hola", session=s)
+def test_missing_metrics_do_not_blow_up():
+    s = FakeSession(FakeResponse({"response": "something"}))
+    r = llm.ask_sync("hello", session=s)
     assert r.ok
     assert r.latency_ms is None and r.tokens_in is None
 
 
-# ── Salida estructurada ────────────────────────────────────────
+# ── Structured output ──────────────────────────────────────────
 
-def test_el_esquema_viaja_en_format():
+def test_the_schema_travels_in_format():
     s = FakeSession(FakeResponse(OK_BODY))
-    esquema = {"type": "object"}
-    llm.ask_sync("hola", schema=esquema, session=s)
-    assert s.last_json["format"] == esquema
+    the_schema = {"type": "object"}
+    llm.ask_sync("hello", schema=the_schema, session=s)
+    assert s.last_json["format"] == the_schema
 
 
-def test_sin_esquema_no_se_envia_format():
+def test_without_a_schema_no_format_is_sent():
     s = FakeSession(FakeResponse(OK_BODY))
-    llm.ask_sync("hola", session=s)
+    llm.ask_sync("hello", session=s)
     assert "format" not in s.last_json
 
 
-def test_se_parsea_la_salida_estructurada():
+def test_structured_output_is_parsed():
     body = dict(OK_BODY, response='{"action": "NOTHING", "reasoning": "ok"}')
-    r = llm.ask_sync("hola", schema={"type": "object"}, session=FakeSession(
+    r = llm.ask_sync("hello", schema={"type": "object"}, session=FakeSession(
         FakeResponse(body)))
     assert r.data == {"action": "NOTHING", "reasoning": "ok"}
 
 
-def test_estructura_ilegible_conserva_el_texto():
-    """No es un error: la capa de decisión puede recurrir al parser anclado."""
-    body = dict(OK_BODY, response="esto no es JSON")
-    r = llm.ask_sync("hola", schema={"type": "object"}, session=FakeSession(
+def test_an_unreadable_structure_keeps_the_text():
+    """Not an error: the decision layer can fall back to the anchored parser."""
+    body = dict(OK_BODY, response="this is not JSON")
+    r = llm.ask_sync("hello", schema={"type": "object"}, session=FakeSession(
         FakeResponse(body)))
     assert r.ok
     assert r.data is None
-    assert r.text == "esto no es JSON"
+    assert r.text == "this is not JSON"
 
 
-# ── Versión asíncrona ──────────────────────────────────────────
+# ── Async version ──────────────────────────────────────────────
 
-def test_ask_no_bloquea_el_event_loop(monkeypatch):
-    """`requests` es síncrono: debe ejecutarse en un hilo aparte.
+def test_ask_does_not_block_the_event_loop(monkeypatch):
+    """`requests` is synchronous, so it must run in a separate thread.
 
-    Se comprueba que otra corrutina progresa mientras la llamada está en curso. Sin
-    `asyncio.to_thread`, el event loop quedaría bloqueado toda la inferencia —
-    decenas de segundos en los que el orquestador no puede hacer nada más.
+    Verified by checking another coroutine makes progress while the call is in
+    flight. Without `asyncio.to_thread` the event loop would be blocked for the
+    whole inference — tens of seconds in which the orchestrator can do nothing.
     """
     import asyncio
     import time
 
-    def lenta(*a, **k):
+    def slow(*a, **k):
         time.sleep(0.2)
         return llm.LLMResult(text="DECISION: NOTHING")
 
-    monkeypatch.setattr(llm, "ask_sync", lenta)
+    monkeypatch.setattr(llm, "ask_sync", slow)
 
-    async def escenario():
-        latidos = 0
+    async def scenario():
+        beats = 0
 
-        async def latir():
-            nonlocal latidos
+        async def heartbeat():
+            nonlocal beats
             while True:
-                latidos += 1
+                beats += 1
                 await asyncio.sleep(0.01)
 
-        tarea = asyncio.create_task(latir())
-        resultado = await llm.ask("hola")
-        tarea.cancel()
-        return resultado, latidos
+        task = asyncio.create_task(heartbeat())
+        result = await llm.ask("hello")
+        task.cancel()
+        return result, beats
 
-    resultado, latidos = asyncio.run(escenario())
-    assert resultado.text == "DECISION: NOTHING"
-    assert latidos > 5, "el event loop se quedó bloqueado durante la llamada"
+    result, beats = asyncio.run(scenario())
+    assert result.text == "DECISION: NOTHING"
+    assert beats > 5, "the event loop was blocked during the call"

@@ -8,14 +8,14 @@ services:
       - ollama_data:/root/.ollama
     environment:
       - OLLAMA_FLASH_ATTENTION=1
-      # Escuchar en todas las interfaces: las VMs del laboratorio (fase 7) alcanzan
-      # Ollama en la IP de WSL2, no en localhost.
+      # Listen on all interfaces: the phase 7 lab VMs reach Ollama on the WSL2
+      # IP, not on localhost.
       - OLLAMA_HOST=0.0.0.0
-      # Mantener el modelo residente entre ciclos del orquestador (uno cada 20 s).
-      # Sin esto, cada consulta puede recargar varios GB en VRAM.
+      # Keep the model resident between orchestrator cycles (one every 20 s).
+      # Without this, each query may reload several GB into VRAM.
       - OLLAMA_KEEP_ALIVE=30m
-      # 12 GB de VRAM: un solo modelo cargado a la vez, importante durante la
-      # comparativa de modelos para que no compitan por memoria.
+      # 12 GB of VRAM: one model loaded at a time. Important during the model
+      # comparison so they do not compete for memory.
       - OLLAMA_MAX_LOADED_MODELS=1
     healthcheck:
       test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]

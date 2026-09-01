@@ -1,35 +1,14 @@
-"""Cliente de Ollama.
+"""Ollama client. Nothing here raises: it always returns an `LLMResult`.
 
-Sustituye a la función `ask_ollama` original, que tenía tres problemas en quince
-líneas:
-
-- **Sin `timeout`.** Si Ollama se colgaba, el EDR se colgaba con él, para siempre
-  y sin ningún mensaje.
-- **Era `async def` pero llamaba a `requests.post` síncrono**, bloqueando el event
-  loop de asyncio durante toda la inferencia.
-- **No pasaba `options`**, así que Ollama usaba su `num_ctx` por defecto (4096 en
-  la 0.32). Medido: un prompt de ronda 2 con 50 eventos execve ocupa ya ~2563
-  tokens solo en esa sección.
-
-Sobre el desbordamiento de contexto conviene ser preciso, porque es contraintuitivo.
-Medido contra Ollama 0.32.4 con `num_ctx=512` y un prompt de ~3400 tokens: una
-instrucción colocada al FINAL se obedece, y la misma instrucción al PRINCIPIO se
-ignora por completo. **Ollama descarta la cabeza del prompt y conserva la cola.**
-Es decir, la línea `DECISION:` nunca se pierde — lo que desaparece, en silencio, es
-la evidencia. El modelo responde entonces con total seguridad sobre datos que nunca
-vio y cuya ausencia desconoce, que es un fallo bastante peor que una respuesta
-truncada: ésta se detectaría al instante.
-
-De ahí que el recorte se haga explícitamente en `edr/prompts.py` y no se delegue en
-Ollama.
-
-Nada de este módulo lanza excepciones: siempre devuelve un `LLMResult`.
+Context overflow is handled in edr/prompts.py rather than delegated to Ollama,
+because Ollama discards the HEAD of the prompt and keeps the tail — so the
+DECISION line always survives while the evidence disappears silently.
 """
 
 import asyncio
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import requests
 
@@ -40,10 +19,10 @@ log = logging.getLogger("edr.llm")
 
 @dataclass
 class LLMResult:
-    """Resultado de una consulta, incluidas las métricas que alimentan la Fase 7."""
+    """One query's result, including the metrics that feed the phase 7 tables."""
 
     text: str = ""
-    data: dict | None = None          # solo si se pidió salida estructurada
+    data: dict | None = None          # only when structured output was requested
     latency_ms: int | None = None
     tokens_in: int | None = None
     tokens_out: int | None = None
@@ -73,11 +52,11 @@ def _options():
 
 
 def ask_sync(prompt, system=None, schema=None, session=None):
-    """Consulta bloqueante. `ask()` la envuelve para no bloquear el event loop.
+    """Blocking query. `ask()` wraps it so the event loop stays free.
 
-    `schema` es un JSON Schema que se pasa en el parámetro `format` de Ollama.
-    Verificado con llama3.1:8b: devuelve JSON válido y respeta los `enum`, lo que
-    es órdenes de magnitud más fiable que aplicar una regex sobre prosa libre.
+    `schema` is a JSON Schema passed in Ollama's `format` parameter. Verified
+    with llama3.1:8b: valid JSON, enums respected — far more reliable than a
+    regex over free prose.
     """
     payload = {
         "model": config.MODEL,
@@ -101,13 +80,13 @@ def ask_sync(prompt, system=None, schema=None, session=None):
         body = response.json()
     except requests.Timeout:
         return LLMResult(model=config.MODEL,
-                         error=f"timeout tras {config.LLM_READ_TIMEOUT:.0f}s")
+                         error=f"timed out after {config.LLM_READ_TIMEOUT:.0f}s")
     except requests.RequestException as e:
         return LLMResult(model=config.MODEL, error=f"{type(e).__name__}: {e}")
     except ValueError as e:
-        # Ollama devolvió algo que no es JSON (una página de error de un proxy,
-        # por ejemplo). Es un fallo de infraestructura, no del modelo.
-        return LLMResult(model=config.MODEL, error=f"respuesta no es JSON: {e}")
+        # Ollama returned something that is not JSON — a proxy error page, say.
+        # Infrastructure failure, not a model failure.
+        return LLMResult(model=config.MODEL, error=f"response is not JSON: {e}")
 
     text = (body.get("response") or "").strip()
 
@@ -117,7 +96,7 @@ def ask_sync(prompt, system=None, schema=None, session=None):
         tokens_in=body.get("prompt_eval_count"),
         tokens_out=body.get("eval_count"),
     )
-    # total_duration viene en nanosegundos.
+    # total_duration comes in nanoseconds.
     if isinstance(body.get("total_duration"), (int, float)):
         result.latency_ms = int(body["total_duration"] / 1_000_000)
 
@@ -125,20 +104,18 @@ def ask_sync(prompt, system=None, schema=None, session=None):
         try:
             result.data = json.loads(text)
         except (json.JSONDecodeError, TypeError):
-            # No se marca como error: el texto sigue ahí y la capa de decisión
-            # puede recurrir al parser anclado.
-            log.warning("se pidió salida estructurada pero la respuesta no parsea")
+            # Not flagged as an error: the text is still there and the decision
+            # layer can fall back to the anchored parser.
+            log.warning("structured output requested but the response does not parse")
 
     if not text:
-        result.error = "respuesta vacía"
+        result.error = "empty response"
 
     return result
 
 
 async def ask(prompt, system=None, schema=None):
-    """Versión asíncrona. La llamada HTTP va a un hilo aparte.
-
-    `requests` es síncrono: invocarlo directamente desde una corrutina bloquea el
-    event loop durante toda la inferencia, que son decenas de segundos.
+    """Async wrapper. `requests` is synchronous, so the call goes to a thread:
+    running it inline would block the event loop for the whole inference.
     """
     return await asyncio.to_thread(ask_sync, prompt, system, schema)

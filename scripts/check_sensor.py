@@ -1,28 +1,26 @@
 #!/usr/bin/env python3
-"""Comprueba el sensor entero sin arrancar el sistema.
+"""Check the whole sensor without starting the system.
 
     sudo venv/bin/python3 scripts/check_sensor.py
 
-Existe porque un error de sintaxis en C, o un rechazo del verificador de eBPF, no
-se puede detectar sin root: BCC necesita las cabeceras del kernel y las obtiene
-cargando el módulo `kheaders`, cosa que requiere privilegios. Sin esto, el único
-modo de descubrir un fallo en el C sería una ejecución completa del sistema, que
-mezcla ese fallo con los de todo lo demás.
+A C syntax error or a verifier rejection cannot be caught without root: BCC
+needs kernel headers and gets them by loading the `kheaders` module. Without
+this script the only way to find a bug in the C would be a full system run,
+which mixes it up with everything else.
 
-Comprueba cinco cosas en una sola ejecución privilegiada, que es lo que hace
-barato iterar sobre el programa en C:
+Five checks in one privileged run:
 
-1. Compila y el verificador lo acepta.
-2. Las sondas se enganchan (un símbolo puede faltar aunque el programa sea válido).
-3. El espejo de ctypes cuadra con las structs de C.
-4. **Captura de verdad**: lanza un proceso conocido y lee sus eventos.
-5. El triaje puntúa esos eventos como se espera.
+1. It compiles and the verifier accepts it.
+2. The probes attach (a symbol can be missing even if the program is valid).
+3. The ctypes mirror matches the C structs.
+4. **Real capture**: launches a known process and reads its events.
+5. The triage scores those events as expected.
 
-Los puntos 4 y 5 son los que distinguen "el programa carga" de "el sensor
-funciona". Una struct desalineada compila y engancha perfectamente, y lo único
-que delata el fallo es leer un evento real y ver salir basura.
+Steps 4 and 5 are what separate "the program loads" from "the sensor works": a
+misaligned struct compiles and attaches perfectly, and only reading a real event
+gives it away.
 
-Devuelve 0 si todo pasa; 1 en cuanto algo falla.
+Exits 0 if everything passes, 1 as soon as something fails.
 """
 
 import ctypes as ct
@@ -37,35 +35,32 @@ import forensic_mcp  # noqa: E402
 from edr import procinfo, triage  # noqa: E402
 from edr.eventstore import EventStore  # noqa: E402
 
-# Orden que se lanza para provocar un evento.
-#
-# Tres propiedades buscadas a propósito:
-#   - Argumentos reconocibles: si el desplazamiento de `args` estuviera mal,
-#     saldría basura en su lugar y se vería a simple vista.
-#   - Uno de ellos lleva un espacio ("mundo raro"): demuestra que los argumentos
-#     se separan por el '\0' que escribe la sonda y no partiendo por espacios.
-#   - El proceso dura un segundo, así que sigue vivo mientras se sondea. Hace
-#     falta para comprobar el ppid, que se resuelve leyendo /proc.
-ORDEN = ["/bin/sh", "-c", "sleep 1", "marcador", "mundo raro"]
-ESPERADO = "-c sleep 1 marcador mundo raro"
+# The command launched to provoke an event. Three deliberate properties:
+#   - recognisable arguments, so a wrong `args` offset shows up as garbage;
+#   - one argument contains a space, proving the arguments are split on the
+#     probe's '\0' and not on whitespace;
+#   - it lives a second, so it is still alive while the ring buffer is polled,
+#     which is needed to resolve ppid from /proc.
+COMMAND = ["/bin/sh", "-c", "sleep 1", "marker", "odd world"]
+EXPECTED_CMDLINE = "-c sleep 1 marker odd world"
 
 
-def compilar():
-    lineas = forensic_mcp.ebpf_code.count("\n")
-    print(f"[*] Compilando el programa eBPF ({lineas} líneas de C)…")
+def compile_program():
+    lines = forensic_mcp.ebpf_code.count("\n")
+    print(f"[*] Compiling the eBPF program ({lines} lines of C)…")
     try:
         from bcc import BPF
         bpf = BPF(text=forensic_mcp.ebpf_code)
     except Exception as e:  # noqa: BLE001
-        print("\n[FALLO] el programa no compila o el verificador lo rechaza:\n")
+        print("\n[FAIL] the program does not compile or the verifier rejects it:\n")
         print(str(e)[:4000])
         return None
-    print("[ OK ] compila, carga y pasa el verificador.")
+    print("[ OK ] compiles, loads and passes the verifier.")
     return bpf
 
 
-def enganchar(bpf):
-    print("\n[*] Enganchando sondas…")
+def attach_probes(bpf):
+    print("\n[*] Attaching probes…")
     ok = True
     for syscall in ("finit_module", "init_module"):
         try:
@@ -73,171 +68,165 @@ def enganchar(bpf):
             bpf.attach_kprobe(event=fnname, fn_name="kprobe_module_load")
             print(f"  [ OK ] kprobe:{syscall}  ({fnname.decode()})")
         except Exception as e:  # noqa: BLE001
-            print(f"  [FALLO] kprobe:{syscall}: {e}")
+            print(f"  [FAIL] kprobe:{syscall}: {e}")
             ok = False
-    # El tracepoint de execve lo declara la macro TRACEPOINT_PROBE, que lo engancha
-    # sola al cargar el programa: no aparece aquí porque no hay nada que enganchar.
-    print("  [ OK ] tracepoint:sys_enter_execve (automático, vía TRACEPOINT_PROBE)")
+    # TRACEPOINT_PROBE attaches the execve tracepoint by itself at load time,
+    # so there is nothing to attach here.
+    print("  [ OK ] tracepoint:sys_enter_execve (automatic, via TRACEPOINT_PROBE)")
     return ok
 
 
-def comprobar_ctypes():
-    print("\n[*] Espejo de ctypes…")
-    esperados = {"EvHdr": 64, "ModuleEvent": 64, "ExecEvent": 528}
+def check_ctypes():
+    print("\n[*] ctypes mirror…")
+    expected_sizes = {"EvHdr": 64, "ModuleEvent": 64, "ExecEvent": 528}
     ok = True
-    for nombre, tam in esperados.items():
-        real = ct.sizeof(getattr(forensic_mcp, nombre))
-        marca = " OK " if real == tam else "FALLO"
-        if real != tam:
+    for name, size in expected_sizes.items():
+        actual = ct.sizeof(getattr(forensic_mcp, name))
+        mark = " OK " if actual == size else "FAIL"
+        if actual != size:
             ok = False
-        print(f"  [{marca}] sizeof({nombre}) = {real} (esperado {tam})")
+        print(f"  [{mark}] sizeof({name}) = {actual} (expected {size})")
 
-    for campo, off in (("hdr", 0), ("filename", 64), ("args", 192),
+    for field, off in (("hdr", 0), ("filename", 64), ("args", 192),
                        ("args_len", 512)):
-        real = getattr(forensic_mcp.ExecEvent, campo).offset
-        marca = " OK " if real == off else "FALLO"
-        if real != off:
+        actual = getattr(forensic_mcp.ExecEvent, field).offset
+        mark = " OK " if actual == off else "FAIL"
+        if actual != off:
             ok = False
-        print(f"  [{marca}] ExecEvent.{campo} en el byte {real} (esperado {off})")
+        print(f"  [{mark}] ExecEvent.{field} at byte {actual} (expected {off})")
     return ok
 
 
-def _lanzar():
-    """Ejecuta la orden con un fork explícito y devuelve el PID del hijo.
+def _spawn():
+    """Run the command with an explicit fork and return the child's pid.
 
-    Se hace a mano en vez de con `subprocess.run` para saber con certeza qué PID
-    buscar y quién es su padre. Con `subprocess` no se sabe: CPython puede usar
-    `posix_spawn`, y en esta máquina el proceso resultante apareció colgando de un
-    intermediario, no del script.
+    Done by hand rather than with `subprocess.run` so there is no doubt about
+    which pid to look for and who its parent is: CPython may use `posix_spawn`,
+    and on this machine that left the process hanging off an intermediary.
 
-    No se espera al hijo aquí: tiene que seguir vivo mientras se sondea el ring
-    buffer, porque el `ppid` se resuelve leyendo su /proc.
+    The child is not reaped here: it has to stay alive while the ring buffer is
+    polled, because ppid is resolved by reading its /proc.
     """
     pid = os.fork()
     if pid == 0:
         try:
             devnull = os.open(os.devnull, os.O_WRONLY)
             os.dup2(devnull, 1)
-            os.execv(ORDEN[0], ORDEN)
+            os.execv(COMMAND[0], COMMAND)
         finally:
-            os._exit(127)   # solo se llega aquí si execv falló
+            os._exit(127)   # only reached if execv failed
     return pid
 
 
-def capturar(bpf):
-    """Lanza una orden conocida y comprueba que el evento llega íntegro.
+def capture(bpf):
+    """Launch a known command and check the event arrives intact.
 
-    Se invoca `handle_event`, la misma función que usa el sistema en marcha, y se
-    mira lo que deja en el almacén. Duplicar aquí la extracción de campos haría
-    que la comprobación pasara mientras la ruta real está rota — que es justo lo
-    que pasó con el `ppid` al moverlo de la sonda a userspace.
+    Calls `handle_event`, the same function the running system uses. Duplicating
+    the field extraction here would let this check pass while the real path is
+    broken — which is exactly what happened with ppid.
     """
-    print(f"\n[*] Captura en vivo: {' '.join(ORDEN)}")
+    print(f"\n[*] Live capture: {' '.join(COMMAND)}")
 
-    almacen = EventStore(None, cap=500)
-    forensic_mcp.STORE = almacen
+    store = EventStore(None, cap=500)
+    forensic_mcp.STORE = store
 
     bpf["events"].open_ring_buffer(
         lambda ctx, data, size: forensic_mcp.handle_event(data, size))
 
-    hijo = _lanzar()
+    child = _spawn()
 
-    # Se sondea mientras el hijo sigue vivo: el evento llega de inmediato, pero
-    # el ppid se lee de /proc y para eso el proceso tiene que existir todavía.
-    limite = time.monotonic() + 0.8
-    while time.monotonic() < limite:
+    # Polled while the child is alive: the event arrives immediately, but ppid
+    # comes from /proc and needs the process to still exist.
+    deadline = time.monotonic() + 0.8
+    while time.monotonic() < deadline:
         bpf.ring_buffer_poll(50)
 
-    # El starttime de /proc se lee AQUÍ, con el proceso todavía vivo: después del
-    # waitpid ya ha sido recogido y su /proc no existe.
-    starttime_proc = procinfo.starttime(hijo)
-    os.waitpid(hijo, 0)
+    # Read HERE, with the process still alive: after waitpid it has been reaped
+    # and its /proc is gone.
+    proc_starttime = procinfo.starttime(child)
+    os.waitpid(child, 0)
 
-    # Se busca por PID exacto: es el único evento que con seguridad es el nuestro.
-    nuestro = [e for e in almacen.query(limit=0) if e.get("pid") == hijo]
-    if not nuestro:
-        total = len(almacen.query(limit=0))
-        print(f"  [FALLO] no llegó el evento del PID {hijo} "
-              f"({total} eventos capturados en total)")
+    # Matched by exact pid: the only event that is certainly ours.
+    ours = [e for e in store.query(limit=0) if e.get("pid") == child]
+    if not ours:
+        total = len(store.query(limit=0))
+        print(f"  [FAIL] no event arrived for pid {child} "
+              f"({total} events captured in total)")
         return False
 
-    ev = nuestro[-1]
-    print(f"  evento: pid={ev['pid']} ppid={ev['ppid']} uid={ev['uid']} "
+    ev = ours[-1]
+    print(f"  event: pid={ev['pid']} ppid={ev['ppid']} uid={ev['uid']} "
           f"caller_comm={ev.get('caller_comm')}")
     print(f"  filename: {ev['filename']}")
     print(f"  cmdline:  {ev['cmdline']!r}")
 
     ok = True
 
-    def comprobar(condicion, bien, mal):
+    def check(condition, good, bad):
         nonlocal ok
-        if condicion:
-            print(f"  [ OK ] {bien}")
+        if condition:
+            print(f"  [ OK ] {good}")
         else:
-            print(f"  [FALLO] {mal}")
+            print(f"  [FAIL] {bad}")
             ok = False
 
-    comprobar(ev["cmdline"] == ESPERADO,
-              "la línea de órdenes llega completa, en orden y con los espacios",
-              f"línea de órdenes inesperada: se esperaba {ESPERADO!r}")
+    check(ev["cmdline"] == EXPECTED_CMDLINE,
+          "the command line arrives complete, in order and with its spaces",
+          f"unexpected command line: expected {EXPECTED_CMDLINE!r}")
 
-    # La identidad es el logro de la fase 3a: si volviera a cero, se habría roto.
-    comprobar(bool(ev["starttime"]),
-              f"identidad capturada en la sonda (starttime={ev['starttime']})",
-              "starttime vacío: se perdió la captura de identidad")
+    check(bool(ev["starttime"]),
+          f"identity captured in the probe (starttime={ev['starttime']})",
+          "empty starttime: identity capture was lost")
 
-    comprobar(ev["ppid"] == os.getpid(),
-              "el ppid apunta al proceso que lanzó la orden",
-              f"el ppid debería ser el de este script ({os.getpid()}) "
-              f"y es {ev['ppid']}")
+    check(ev["ppid"] == os.getpid(),
+          "ppid points at the process that launched the command",
+          f"ppid should be this script's ({os.getpid()}) and is {ev['ppid']}")
 
-    comprobar(ev["filename"] == ORDEN[0],
-              f"filename correcto ({ev['filename']})",
-              f"filename inesperado: {ev['filename']}")
+    check(ev["filename"] == COMMAND[0],
+          f"filename correct ({ev['filename']})",
+          f"unexpected filename: {ev['filename']}")
 
-    # La comprobación decisiva en esta máquina: el PID tiene que estar en la
-    # numeración que ve /proc, no en la del namespace inicial del kernel.
-    comprobar(not ev["foreign_ns"],
-              "el PID está en la numeración de /proc, no en la global",
-              "el PID no se tradujo al namespace del EDR")
+    # The decisive check on this machine: the pid must be in the numbering
+    # /proc uses, not the kernel's initial namespace.
+    check(not ev["foreign_ns"],
+          "the pid is in /proc's numbering, not the global one",
+          "the pid was not translated into the EDR's namespace")
 
-    # Y la prueba definitiva de que ese PID significa algo aquí: el starttime que
-    # capturó la sonda tiene que coincidir con el que /proc reporta para ese PID.
-    # Es exactamente la comprobación de la que depende toda la remediación.
-    comprobar(starttime_proc is not None and starttime_proc == ev["starttime"],
-              "el starttime coincide con /proc: la salvaguarda anti-reutilización "
-              "de PID puede funcionar",
-              f"el starttime de la sonda ({ev['starttime']}) no coincide con el "
-              f"de /proc ({starttime_proc})")
+    # And the proof that the pid means something here: the starttime the probe
+    # captured must match what /proc reports for it. The whole remediation path
+    # depends on this.
+    check(proc_starttime is not None and proc_starttime == ev["starttime"],
+          "starttime matches /proc: the pid-reuse safeguard can work",
+          f"probe starttime ({ev['starttime']}) does not match /proc "
+          f"({proc_starttime})")
 
     return ok
 
 
-def comprobar_namespace():
-    """Avisa si el EDR corre dentro de un namespace de PIDs anidado.
+def check_namespace():
+    """Note whether the EDR runs inside a nested PID namespace.
 
-    No es un fallo —el sensor lo traduce— pero conviene que quede en la salida:
-    es la diferencia entre esta máquina y la VM del laboratorio de la fase 7, y
-    explica por qué el sensor necesita el helper de traducción.
+    Not a failure — the sensor translates — but worth having in the output: it
+    is the difference between this machine and the phase 7 lab VM.
     """
-    NS_INICIAL = 4026531836   # inodo fijo del namespace de PIDs inicial
+    INITIAL_NS = 4026531836   # fixed inode of the initial PID namespace
     st = os.stat("/proc/self/ns/pid")
 
-    print("\n[*] Namespace de PIDs…")
-    if st.st_ino == NS_INICIAL:
-        print("  [ OK ] el EDR corre en el namespace inicial del kernel")
+    print("\n[*] PID namespace…")
+    if st.st_ino == INITIAL_NS:
+        print("  [ OK ] the EDR runs in the kernel's initial namespace")
     else:
-        print(f"  [nota] namespace anidado (inodo {st.st_ino}, el inicial es "
-              f"{NS_INICIAL})")
-        print("         los PIDs se traducen en la sonda; sin eso, /proc y las "
-              "salvaguardas leerían otro proceso")
+        print(f"  [note] nested namespace (inode {st.st_ino}, initial is "
+              f"{INITIAL_NS})")
+        print("         pids are translated in the probe; without that, /proc "
+              "and the safeguards would read another process")
     return True
 
 
-def comprobar_triaje():
-    """El triaje debe distinguir las dos órdenes de la demo."""
-    print("\n[*] Triaje sobre eventos de ejemplo…")
-    casos = [
+def check_triage():
+    """The triage must tell the two demo commands apart."""
+    print("\n[*] Triage on sample events…")
+    cases = [
         ({"filename": "/usr/bin/curl",
           "cmdline": "-s https://api.github.com/health"}, False),
         ({"filename": "/usr/bin/curl",
@@ -245,39 +234,39 @@ def comprobar_triaje():
         ({"filename": "/tmp/.systemd-update", "cmdline": "600"}, True),
     ]
     ok = True
-    for evento, debe_escalar in casos:
-        severidad, reglas = triage.assess(evento)
-        escala = triage.should_escalate(evento)
-        marca = " OK " if escala == debe_escalar else "FALLO"
-        if escala != debe_escalar:
+    for event, should_escalate in cases:
+        severity, rules = triage.assess(event)
+        escalates = triage.should_escalate(event)
+        mark = " OK " if escalates == should_escalate else "FAIL"
+        if escalates != should_escalate:
             ok = False
-        print(f"  [{marca}] {evento['filename']} {evento['cmdline'][:40]!r} → "
-              f"severidad={severidad} reglas={reglas or '-'}")
+        print(f"  [{mark}] {event['filename']} {event['cmdline'][:40]!r} → "
+              f"severity={severity} rules={rules or '-'}")
     return ok
 
 
 def main():
     if os.geteuid() != 0:
-        print("[!] Necesita root: BCC carga el módulo kheaders para compilar.")
+        print("[!] Needs root: BCC loads the kheaders module to compile.")
         print("    sudo venv/bin/python3 scripts/check_sensor.py")
         return 1
 
-    bpf = compilar()
+    bpf = compile_program()
     if bpf is None:
         return 1
 
-    pasos = [
-        enganchar(bpf),
-        comprobar_ctypes(),
-        comprobar_namespace(),
-        capturar(bpf),
-        comprobar_triaje(),
+    steps = [
+        attach_probes(bpf),
+        check_ctypes(),
+        check_namespace(),
+        capture(bpf),
+        check_triage(),
     ]
 
-    if all(pasos):
-        print("\n[+] Todo correcto. Puedes arrancar el sistema.")
+    if all(steps):
+        print("\n[+] All good. The system is ready to start.")
         return 0
-    print("\n[-] Hay comprobaciones en fallo, revisa la salida de arriba.")
+    print("\n[-] Some checks failed, see the output above.")
     return 1
 
 

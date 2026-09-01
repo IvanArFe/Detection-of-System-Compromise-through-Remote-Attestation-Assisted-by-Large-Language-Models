@@ -1,9 +1,9 @@
-# EDR autónomo — dependencias del venv
-# Instalar con: pip install -r requirements.txt
+# Autonomous EDR — venv dependencies
+# Install with: pip install -r requirements.txt
 #
-# NOTA: bcc (python3-bpfcc) es un paquete del sistema y NO se instala con pip.
-# Instálalo con: sudo apt install python3-bpfcc
-# Luego crea los symlinks en el venv si es necesario (ver CLAUDE.md).
+# NOTE: bcc (python3-bpfcc) is a system package and does NOT install with pip.
+# Install it with: sudo apt install python3-bpfcc
+# Then create the symlinks into the venv if needed (see README.md, Installation).
 
 mcp==1.27.0
 requests==2.33.1

@@ -1,25 +1,11 @@
-"""Almacén de eventos compartido entre los sensores y las herramientas MCP.
+"""Event store shared by the sensor threads and the MCP tools.
 
-**El problema que resuelve.** Los sensores eBPF y el servidor MCP viven en el
-mismo proceso pero en hilos distintos, y hasta ahora se comunicaban a través de
-un fichero JSON: el hilo sensor lo reescribía entero en cada evento mientras el
-hilo principal hacía `json.load` desde las herramientas. Sin sincronización. El
-resultado eran `JSONDecodeError` intermitentes que acababan llegando al LLM como
-texto de error y contaminaban su razonamiento con algo que interpretaba como
-telemetría.
-
-La solución no es poner un lock al fichero: es **sacar el fichero del camino de
-datos**. Los eventos viven en memoria bajo un lock, y el fichero pasa a ser solo
-registro forense append-only.
-
-Tres propiedades, cada una matando un fallo de raíz:
-
-- **Todo bajo `self._lock`**, y las herramientas leen de memoria, nunca del disco.
-- **JSONL en vez de JSON reescrito.** Una línea corrupta no invalida el resto del
-  fichero, y escribir una línea corta es efectivamente atómico.
-- **`seq` monotónico y `ack` explícito.** Antes los eventos no se consumían nunca:
-  pasada la ventana de deduplicación, la misma alerta se reanalizaba eternamente.
-  Ahora el orquestador confirma lo que ya procesó, de forma auditable.
+Sensors and MCP server live in the same process but different threads. They used
+to talk through a JSON file that the sensor rewrote whole on every event while
+the tools read it back, which produced intermittent JSONDecodeErrors that reached
+the LLM as telemetry. The fix is not to lock the file but to take it out of the
+data path: events live in memory under a lock, and the file becomes an
+append-only forensic record.
 """
 
 import json
@@ -29,18 +15,16 @@ from datetime import datetime, timezone
 
 
 def utc_now():
-    """Marca de tiempo ISO-8601 en UTC.
+    """ISO-8601 UTC timestamp.
 
-    El formato anterior (`%d-%m-%Y %H:%M:%S` en hora local) no llevaba zona ni
-    subsegundos y no era ordenable lexicográficamente, así que no se podía
-    correlacionar con los TIMESTAMPTZ que Supabase guarda en UTC. Hará falta para
-    medir latencias de detección.
+    Lexicographically sortable and with a zone, so it correlates with the
+    TIMESTAMPTZ values Supabase stores.
     """
     return datetime.now(timezone.utc).isoformat()
 
 
 class EventStore:
-    """Cola de eventos acotada, segura entre hilos, con confirmación explícita."""
+    """Bounded, thread-safe event queue with explicit acknowledgement."""
 
     def __init__(self, jsonl_path=None, cap=2000):
         self._lock = threading.Lock()
@@ -51,23 +35,21 @@ class EventStore:
         self._jsonl_path = str(jsonl_path) if jsonl_path else None
         self._fh = None
 
-    # ── escritura ──────────────────────────────────────────────
+    # ── writing ────────────────────────────────────────────────
 
     def append(self, kind, **fields):
-        """Registra un evento y devuelve su número de secuencia.
+        """Record an event and return its sequence number.
 
-        El evento se guarda en memoria ANTES de intentar escribirlo a disco: si el
-        disco falla (lleno, solo lectura), se pierde el registro forense pero no la
-        detección. Un sensor que deja de detectar porque no puede escribir un log
-        es peor que uno que detecta sin dejar rastro.
+        Stored in memory BEFORE touching the disk: if the disk fails we lose the
+        forensic record but not the detection.
         """
         with self._lock:
             event = {"seq": self._next_seq, "ts": utc_now(), "kind": kind}
             event.update(fields)
             self._next_seq += 1
 
-            # deque con maxlen descarta por la izquierda en silencio: contarlo es
-            # lo que convierte una pérdida invisible en una métrica.
+            # A maxlen deque discards silently; counting it turns an invisible
+            # loss into a metric.
             if len(self._events) == self._events.maxlen:
                 self._dropped += 1
             self._events.append(event)
@@ -76,7 +58,7 @@ class EventStore:
             return event["seq"]
 
     def _write_line(self, event):
-        """Añade una línea al JSONL. Se llama con el lock ya tomado."""
+        """Append one line to the JSONL. Called with the lock held."""
         if not self._jsonl_path:
             return
         try:
@@ -85,18 +67,17 @@ class EventStore:
             self._fh.write(json.dumps(event, ensure_ascii=False) + "\n")
             self._fh.flush()
         except OSError:
-            # Se degrada a solo-memoria en vez de propagar hacia el hilo sensor.
+            # Degrade to memory-only rather than propagate into the sensor thread.
             self._jsonl_path = None
             self._fh = None
 
-    # ── lectura ────────────────────────────────────────────────
+    # ── reading ────────────────────────────────────────────────
 
     def query(self, kind=None, pid=None, since_seq=0, limit=50):
-        """Eventos que casan con los filtros, en orden cronológico.
+        """Matching events in chronological order.
 
-        Cuando hay más coincidencias que `limit` se devuelven las MÁS RECIENTES:
-        ante un desbordamiento, lo último que pasó es más informativo que lo
-        primero.
+        On overflow the MOST RECENT are returned: what just happened is more
+        informative than what happened first.
         """
         with self._lock:
             matches = [
@@ -108,21 +89,15 @@ class EventStore:
         return matches[-limit:] if limit and limit > 0 else matches
 
     def pending(self, kind=None, limit=50, predicate=None):
-        """Eventos aún no confirmados, del más antiguo al más reciente.
+        """Unacknowledged events, oldest first.
 
-        Aquí el orden importa al revés que en `query`: se devuelven los más
-        ANTIGUOS para que la confirmación avance de forma contigua y no queden
-        huecos sin procesar entre medias.
+        Oldest-first so acknowledgement advances contiguously and leaves no
+        unprocessed gaps behind.
 
-        `predicate` es un invocable que decide si un evento cuenta, y se aplica
-        **antes** del recorte por `limit`. El orden no es un detalle: como se
-        devuelven los más antiguos, con miles de eventos irrelevantes por delante
-        —que es exactamente la proporción real de los execve— filtrar después del
-        recorte devolvería una ventana llena de ruido y dejaría fuera justo los
-        eventos que interesan.
-
-        El almacén no sabe nada de en qué consiste ser interesante: recibe la
-        decisión ya tomada desde fuera.
+        `predicate` decides whether an event counts and is applied **before** the
+        limit. That ordering matters: with thousands of irrelevant events ahead —
+        the real proportion of execve traffic — filtering after the cut would
+        return a window of pure noise and drop exactly the flagged event.
         """
         with self._lock:
             matches = [
@@ -133,15 +108,13 @@ class EventStore:
             ]
         return matches[:limit] if limit and limit > 0 else matches
 
-    # ── confirmación ───────────────────────────────────────────
+    # ── acknowledgement ────────────────────────────────────────
 
     def ack(self, up_to_seq):
-        """Marca como consumido todo evento con `seq <= up_to_seq`.
+        """Mark every event with `seq <= up_to_seq` as consumed.
 
-        Es monótona: una confirmación con un `seq` menor que el actual se ignora.
-        Sin esa garantía, una respuesta tardía o un reintento del orquestador
-        podría hacer retroceder el puntero y provocar que se reanalizaran alertas
-        ya resueltas.
+        Monotonic: a late acknowledgement cannot move the pointer backwards and
+        cause resolved alerts to be re-analysed.
         """
         with self._lock:
             up_to_seq = int(up_to_seq)
@@ -153,10 +126,10 @@ class EventStore:
             self._acked = up_to_seq
             return newly
 
-    # ── introspección ──────────────────────────────────────────
+    # ── introspection ──────────────────────────────────────────
 
     def stats(self):
-        """Contadores para diagnóstico y para el capítulo de rendimiento."""
+        """Counters for diagnosis and for the performance chapter."""
         with self._lock:
             return {
                 "in_memory": len(self._events),

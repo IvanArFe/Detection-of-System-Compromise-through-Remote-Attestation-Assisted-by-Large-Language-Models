@@ -1,14 +1,9 @@
-"""Decodificación de las tablas de sockets de /proc/net.
+"""Decoding the /proc/net socket tables.
 
-El kernel expone las direcciones en hexadecimal y en **orden de byte nativo**, que
-en x86 es little-endian. Eso obliga a invertir bytes, y es donde estaba el fallo:
-`/proc/{pid}/net/tcp6` se pasaba por el decodificador de IPv4, que se queda con 4
-bytes de una dirección de 128 bits. El LLM recibía **direcciones inventadas** y
-razonaba sobre ellas como si fueran reales — con la lógica anterior, `::1` se le
-presentaba como `0.0.0.1`.
-
-No es un caso rebuscado: esta máquina tiene un socket IPv6 escuchando en el puerto
-11434, que es el propio Ollama.
+The kernel exposes addresses in hex and in native byte order, which on x86 is
+little-endian. IPv6 tables used to be run through the IPv4 decoder, which keeps
+4 bytes of a 128-bit address: the LLM was shown `0.0.0.1` for `::1` and reasoned
+about it as if it were real.
 """
 
 import socket
@@ -23,7 +18,7 @@ TCP_STATES = {
 
 
 def decode_ipv4(hex_str):
-    """8 dígitos hex, un u32 little-endian."""
+    """8 hex digits, one little-endian u32."""
     try:
         return socket.inet_ntop(socket.AF_INET, struct.pack("<I", int(hex_str, 16)))
     except (ValueError, OSError, struct.error):
@@ -31,14 +26,10 @@ def decode_ipv4(hex_str):
 
 
 def decode_ipv6(hex_str):
-    """32 dígitos hex: cuatro u32 little-endian consecutivos.
+    """32 hex digits: four consecutive little-endian u32.
 
-    Cada grupo de 8 se invierte por separado; los grupos NO se invierten entre sí.
-    Validado contra `::1` (`00000000000000000000000001000000`) y contra
-    `::ffff:127.0.0.1` (`0000000000000000FFFF00000100007F`).
-
-    Las direcciones IPv4-mapeadas se devuelven en su forma IPv4: es lo que el
-    analista espera ver, y `inet_ntop` ya lo hace por su cuenta.
+    Each group of 8 is byte-swapped individually; the groups themselves are NOT
+    reordered. Validated against `::1` and `::ffff:127.0.0.1`.
     """
     try:
         raw = b"".join(
@@ -50,7 +41,7 @@ def decode_ipv6(hex_str):
 
 
 def decode_addr(hex_str):
-    """Elige el decodificador por la longitud de la cadena, que es lo que la distingue."""
+    """Pick the decoder by string length, which is what tells them apart."""
     if len(hex_str) == 8:
         return decode_ipv4(hex_str)
     if len(hex_str) == 32:
@@ -68,9 +59,9 @@ def parse_endpoint(field):
 
 
 def format_connection(line, wanted_inodes):
-    """Convierte una línea de /proc/net/tcp[6] en texto, o None si no interesa.
+    """Render a /proc/net/tcp[6] line, or None if it is not of interest.
 
-    `wanted_inodes` filtra por los sockets que pertenecen al PID investigado.
+    `wanted_inodes` selects the sockets belonging to the investigated pid.
     """
     parts = line.split()
     if len(parts) < 10 or parts[9] not in wanted_inodes:

@@ -1,8 +1,8 @@
-"""Tests de la interpretación del veredicto.
+"""Tests for verdict interpretation.
 
-Los cuatro primeros bloques son regresiones: cada uno reproduce una entrada que,
-contra el parser anterior, producía una orden de mitigación que nadie había
-decidido. Las cadenas son las que se usaron para demostrar los fallos.
+The first four blocks are regressions: each reproduces an input that, against
+the previous parser, produced a mitigation order nobody had decided. The strings
+are the ones used to demonstrate the bugs.
 """
 
 import pytest
@@ -12,32 +12,32 @@ from edr.decision import (INVALID, INVESTIGATE, MITIGATE, NOTHING, Decision,
 from edr.llm import LLMResult
 
 
-# ── Regresión 1: frase negada ──────────────────────────────────
+# ── Regression 1: a negated sentence ───────────────────────────
 
-def test_una_frase_que_niega_el_veredicto_no_cuenta():
-    """El parser anterior devolvía MITIGATE pid=1 kill: habría atacado systemd."""
-    texto = (
+def test_a_sentence_negating_the_verdict_does_not_count():
+    """The old parser returned MITIGATE pid=1 kill: it would have hit systemd."""
+    text = (
         "We must NOT do DECISION: MITIGATE pid=1 action=kill because that would "
         "kill systemd.\nThe process looks legitimate.\n\nDECISION: NOTHING"
     )
-    assert parse_decision(texto, allowed_pids={1, 4711}).action == NOTHING
+    assert parse_decision(text, allowed_pids={1, 4711}).action == NOTHING
 
 
-def test_gana_la_ultima_decision_no_la_primera():
-    """El modelo razona y cambia de opinión; vale lo que concluye, no lo que tanteó."""
-    texto = "DECISION: MITIGATE pid=4711 action=kill\n\nOn reflection:\nDECISION: NOTHING"
-    assert parse_decision(texto, allowed_pids={4711}).action == NOTHING
+def test_the_last_decision_wins_not_the_first():
+    """The model reasons and changes its mind: what it concludes is what counts."""
+    text = "DECISION: MITIGATE pid=4711 action=kill\n\nOn reflection:\nDECISION: NOTHING"
+    assert parse_decision(text, allowed_pids={4711}).action == NOTHING
 
 
-# ── Regresión 2: eco de las instrucciones ──────────────────────
+# ── Regression 2: echoing the instructions ─────────────────────
 
-def test_el_eco_de_las_instrucciones_es_inofensivo():
-    """No necesita atacante: a los modelos pequeños se les va la instrucción en la respuesta.
+def test_echoing_the_instructions_is_harmless():
+    """No attacker needed: small models leak the instruction into the answer.
 
-    Antes el prompt interpolaba el PID real en sus ejemplos, así que el eco era un
-    veredicto válido y accionable. Ahora los ejemplos llevan el literal <PID>.
+    The prompt used to interpolate the real pid into its examples, so the echo
+    was a valid, actionable verdict. The examples now carry the literal <PID>.
     """
-    texto = (
+    text = (
         "Here is my analysis. The process seems fine.\n"
         "I was told to end with one of these lines:\n"
         "DECISION: MITIGATE pid=<PID> action=freeze\n"
@@ -45,50 +45,50 @@ def test_el_eco_de_las_instrucciones_es_inofensivo():
         "DECISION: NOTHING\n"
         "So my answer is NOTHING."
     )
-    assert parse_decision(texto, allowed_pids={4711}).action == NOTHING
+    assert parse_decision(text, allowed_pids={4711}).action == NOTHING
 
 
-# ── Regresión 3: PID alucinado o inyectado ─────────────────────
+# ── Regression 3: hallucinated or injected pid ─────────────────
 
-def test_un_pid_ausente_de_la_telemetria_se_rechaza():
+def test_a_pid_absent_from_the_telemetry_is_rejected():
     d = parse_decision("DECISION: MITIGATE pid=1 action=kill", allowed_pids={4711})
     assert d.action == INVALID
     assert "1" in d.detail
 
 
-def test_un_pid_presente_en_la_telemetria_se_acepta():
+def test_a_pid_present_in_the_telemetry_is_accepted():
     d = parse_decision("DECISION: MITIGATE pid=4711 action=kill", allowed_pids={4711})
     assert (d.action, d.pid, d.remediation) == (MITIGATE, 4711, "kill")
 
 
-def test_sin_lista_de_pids_no_se_filtra():
-    """Permite usar el parser suelto, por ejemplo desde un test o una herramienta."""
+def test_without_a_pid_list_nothing_is_filtered():
+    """Lets the parser be used standalone, from a test or a tool."""
     assert parse_decision("DECISION: MITIGATE pid=999 action=kill").pid == 999
 
 
-# ── Regresión 4: INVALID no es NOTHING ─────────────────────────
+# ── Regression 4: INVALID is not NOTHING ───────────────────────
 
-@pytest.mark.parametrize("texto", [
+@pytest.mark.parametrize("text", [
     "",
-    "No sé qué hacer con esto.",
+    "I am not sure what to do with this.",
     "The process is suspicious but I cannot decide.",
     "DECISION: PROBABLY",
     "DECISION: MITIGATE pid=abc action=kill",
     "DECISION: MITIGATE pid=4711 action=destroy",
 ])
-def test_una_respuesta_inutilizable_es_invalid(texto):
-    """Antes todo esto colapsaba en NOTHING y falseaba la tasa de falsos negativos."""
-    assert parse_decision(texto, allowed_pids={4711}).action == INVALID
+def test_an_unusable_response_is_invalid(text):
+    """All of this used to collapse into NOTHING and skew the false-negative rate."""
+    assert parse_decision(text, allowed_pids={4711}).action == INVALID
 
 
-def test_invalid_explica_el_motivo():
+def test_invalid_explains_why():
     assert parse_decision("").detail
-    assert parse_decision("bla bla").detail
+    assert parse_decision("blah blah").detail
 
 
-# ── Adornos que añaden los modelos ─────────────────────────────
+# ── Decorations models add ─────────────────────────────────────
 
-@pytest.mark.parametrize("linea", [
+@pytest.mark.parametrize("line", [
     "DECISION: NOTHING",
     "**DECISION: NOTHING**",
     "- DECISION: NOTHING",
@@ -98,24 +98,24 @@ def test_invalid_explica_el_motivo():
     "   decision: nothing   ",
     "DECISION:NOTHING",
 ])
-def test_tolera_markdown_y_variantes(linea):
-    assert parse_decision(linea).action == NOTHING
+def test_markdown_and_variants_are_tolerated(line):
+    assert parse_decision(line).action == NOTHING
 
 
-def test_tolera_adornos_en_una_mitigacion():
+def test_decorations_on_a_mitigation_are_tolerated():
     d = parse_decision("**DECISION: MITIGATE pid=4711 action=freeze**",
                        allowed_pids={4711})
     assert (d.action, d.pid, d.remediation) == (MITIGATE, 4711, "freeze")
 
 
-def test_investigate_se_parsea():
+def test_investigate_parses():
     d = parse_decision("DECISION: INVESTIGATE pid=4711", allowed_pids={4711})
     assert (d.action, d.pid) == (INVESTIGATE, 4711)
 
 
-# ── Salida estructurada ────────────────────────────────────────
+# ── Structured output ──────────────────────────────────────────
 
-def test_estructurada_basica():
+def test_structured_basic():
     d = from_structured(
         {"reasoning": "…", "action": "MITIGATE", "pid": 4711, "remediation": "kill"},
         {4711})
@@ -123,11 +123,11 @@ def test_estructurada_basica():
                                                           "structured")
 
 
-def test_estructurada_ignora_remediation_si_la_accion_no_es_mitigate():
-    """Incoherencia observada de verdad: NOTHING junto a remediation=freeze.
+def test_structured_ignores_remediation_unless_the_action_is_mitigate():
+    """An incoherence observed for real: NOTHING alongside remediation=freeze.
 
-    El esquema acota cada campo por separado, pero no obliga a que sean coherentes
-    entre sí.
+    The schema bounds each field separately but does not force them to be
+    coherent with each other.
     """
     d = from_structured({"action": "NOTHING", "pid": 4711, "remediation": "freeze"},
                         {4711})
@@ -135,101 +135,101 @@ def test_estructurada_ignora_remediation_si_la_accion_no_es_mitigate():
     assert d.remediation is None
 
 
-def test_estructurada_sin_pid_en_una_accion_que_lo_exige():
+def test_structured_without_a_pid_on_an_action_that_needs_one():
     d = from_structured({"action": "MITIGATE", "pid": None}, {4711})
     assert d.action == INVALID
 
 
-def test_estructurada_rechaza_pid_alucinado():
+def test_structured_rejects_a_hallucinated_pid():
     d = from_structured({"action": "MITIGATE", "pid": 1, "remediation": "kill"}, {4711})
     assert d.action == INVALID
 
 
-def test_estructurada_sin_remediation_elige_la_accion_reversible():
-    """Congelar se deshace; matar no. Misma política asimétrica que las salvaguardas."""
+def test_structured_without_remediation_picks_the_reversible_action():
+    """Freezing can be undone; killing cannot. Same asymmetry as the safeguards."""
     d = from_structured({"action": "MITIGATE", "pid": 4711}, {4711})
     assert d.remediation == "freeze"
 
 
-def test_estructurada_con_accion_desconocida_no_es_utilizable():
+def test_structured_with_an_unknown_action_is_unusable():
     assert from_structured({"action": "PANIC", "pid": 4711}, {4711}) is None
 
 
-def test_el_esquema_puede_prohibir_investigate():
-    """En la ronda 2 ya no procede investigar más."""
+def test_the_schema_can_forbid_investigate():
+    """In round 2 there is nothing left to investigate."""
     assert INVESTIGATE not in schema(allow_investigate=False)["properties"]["action"]["enum"]
     assert INVESTIGATE in schema()["properties"]["action"]["enum"]
 
 
-@pytest.mark.parametrize("campo", ["reasoning", "action", "pid", "remediation"])
-def test_el_esquema_exige_todos_los_campos(campo):
-    """Regresión: un campo opcional es un campo que el modelo va a omitir.
+@pytest.mark.parametrize("field", ["reasoning", "action", "pid", "remediation"])
+def test_the_schema_requires_every_field(field):
+    """Regression: an optional field is a field the model will omit.
 
-    En la primera verificación de la Fase 2 el esquema solo exigía `reasoning` y
-    `action`. El modelo respondió `{"action": "INVESTIGATE"}` sin `pid`, dos veces
-    seguidas, aunque citaba los PIDs en su propio razonamiento. Era válido contra
-    aquel esquema y dejaba el ciclo entero en INVALID.
+    With only `reasoning` and `action` required, the model answered
+    `{"action": "INVESTIGATE"}` with no pid, twice in a row, while naming the
+    pids in its own reasoning. It was valid against that schema and left the
+    whole cycle INVALID.
     """
-    assert campo in schema()["required"]
-    assert campo in schema(allow_investigate=False)["required"]
+    assert field in schema()["required"]
+    assert field in schema(allow_investigate=False)["required"]
 
 
-def test_pid_admite_null_para_poder_expresar_no_aplica():
-    """Obligatorio no es lo mismo que no nulo: en NOTHING no hay PID que dar."""
+def test_pid_accepts_null_so_not_applicable_can_be_expressed():
+    """Required is not the same as non-null: a NOTHING verdict has no pid."""
     assert "null" in schema()["properties"]["pid"]["type"]
 
 
-def test_el_esquema_acota_el_pid_a_los_presentados():
-    """Regresión: el modelo devolvía el `ppid` en lugar del `pid`.
+def test_the_schema_bounds_the_pid_to_the_ones_shown():
+    """Regression: the model returned the `ppid` instead of the `pid`.
 
-    La telemetría muestra `pid=108630 ppid=108629` y respondía `108629`, de forma
-    sistemática y también en el reintento. No era alucinación sino confusión entre
-    dos campos numéricos contiguos. Acotar el campo por `enum` lo hace imposible:
-    la gramática derivada del esquema no puede generar otro valor.
+    The telemetry shows `pid=108630 ppid=108629` and it answered `108629`,
+    systematically and on the retry too. Not a hallucination but a confusion
+    between two adjacent numeric fields. Bounding the field with an enum makes
+    it impossible: the derived grammar cannot generate any other value.
     """
-    campo = schema(allowed_pids={108630, 108640})["properties"]["pid"]
+    field = schema(allowed_pids={108630, 108640})["properties"]["pid"]
 
-    assert campo["enum"] == [108630, 108640, None]
-    assert 108629 not in campo["enum"], "el ppid contiguo debe quedar fuera"
+    assert field["enum"] == [108630, 108640, None]
+    assert 108629 not in field["enum"], "the adjacent ppid must be excluded"
 
 
-def test_sin_lista_de_pids_el_campo_queda_abierto():
-    """Permite usar el esquema suelto, sin una telemetría concreta detrás."""
+def test_without_a_pid_list_the_field_stays_open():
+    """Lets the schema be used standalone, with no specific telemetry behind it."""
     assert "enum" not in schema()["properties"]["pid"]
     assert "enum" not in schema(allowed_pids=set())["properties"]["pid"]
 
 
-def test_null_sigue_permitido_al_acotar():
-    """Un veredicto NOTHING no lleva PID: el enum tiene que admitir null."""
+def test_null_is_still_allowed_when_bounded():
+    """A NOTHING verdict carries no pid, so the enum has to admit null."""
     assert None in schema(allowed_pids={1234})["properties"]["pid"]["enum"]
 
 
-# ── decide(): elección de vía ──────────────────────────────────
+# ── decide(): choosing the path ────────────────────────────────
 
-def test_decide_prefiere_la_via_estructurada():
+def test_decide_prefers_the_structured_path():
     r = LLMResult(text="DECISION: NOTHING",
                   data={"action": "MITIGATE", "pid": 4711, "remediation": "kill"})
     d = decide(r, {4711})
     assert (d.action, d.source) == (MITIGATE, "structured")
 
 
-def test_decide_recurre_al_parser_si_no_hay_estructura():
+def test_decide_falls_back_to_the_parser_without_structure():
     d = decide(LLMResult(text="DECISION: NOTHING"), {4711})
     assert (d.action, d.source) == (NOTHING, "parsed")
 
 
-def test_decide_recurre_al_parser_si_la_estructura_no_sirve():
+def test_decide_falls_back_to_the_parser_if_the_structure_is_unusable():
     r = LLMResult(text="DECISION: NOTHING", data={"action": "PANIC"})
     assert decide(r, {4711}).source == "parsed"
 
 
-def test_decide_con_error_del_modelo_es_invalid():
-    d = decide(LLMResult(error="timeout tras 180s"), {4711})
+def test_decide_with_a_model_error_is_invalid():
+    d = decide(LLMResult(error="timed out after 180s"), {4711})
     assert d.action == INVALID
-    assert "timeout" in d.detail
+    assert "timed out" in d.detail
 
 
-def test_decide_sin_resultado_es_invalid():
+def test_decide_without_a_result_is_invalid():
     assert decide(None, {4711}).action == INVALID
 
 

@@ -1,8 +1,8 @@
-"""Tests del almacén de eventos.
+"""Tests for the event store.
 
-El test importante es el de concurrencia: reproduce exactamente el escenario que
-corrompía los datos antes — el hilo del sensor escribiendo mientras el hilo de las
-herramientas MCP lee.
+The important one is the concurrency test: it reproduces exactly the scenario
+that used to corrupt the data — the sensor thread writing while the MCP tool
+thread reads.
 """
 
 import json
@@ -11,7 +11,7 @@ import threading
 from edr.eventstore import EventStore
 
 
-def test_seq_es_monotonico_y_empieza_en_1(tmp_path):
+def test_seq_is_monotonic_and_starts_at_1(tmp_path):
     store = EventStore(tmp_path / "e.jsonl")
 
     assert store.append("execve", pid=1) == 1
@@ -19,96 +19,96 @@ def test_seq_es_monotonico_y_empieza_en_1(tmp_path):
     assert store.append("module_load", pid=3) == 3
 
 
-def test_los_eventos_llevan_timestamp_utc_ordenable(tmp_path):
+def test_events_carry_a_sortable_utc_timestamp(tmp_path):
     store = EventStore(tmp_path / "e.jsonl")
     store.append("execve", pid=1)
     store.append("execve", pid=2)
 
-    eventos = store.query()
-    # ISO-8601 en UTC: ordenable lexicográficamente y correlacionable con Supabase.
-    assert eventos[0]["ts"] <= eventos[1]["ts"]
-    assert "+00:00" in eventos[0]["ts"]
+    events = store.query()
+    # ISO-8601 UTC: lexicographically sortable and correlatable with Supabase.
+    assert events[0]["ts"] <= events[1]["ts"]
+    assert "+00:00" in events[0]["ts"]
 
 
-# ── concurrencia: el bug que motivó este módulo ────────────────
+# ── concurrency: the bug that motivated this module ────────────
 
-def test_escrituras_y_lecturas_concurrentes(tmp_path):
-    """20 hilos escribiendo mientras otros leen: ni una excepción, ni un seq repetido.
+def test_concurrent_reads_and_writes(tmp_path):
+    """20 threads writing while others read: no exception, no duplicate seq.
 
-    Antes, el hilo del sensor reescribía el fichero JSON entero mientras el hilo
-    principal lo parseaba, produciendo JSONDecodeError intermitentes que llegaban
-    al LLM como texto de error.
+    The sensor thread used to rewrite the whole JSON file while the main thread
+    parsed it, producing intermittent JSONDecodeErrors that reached the LLM as
+    error text.
     """
     store = EventStore(tmp_path / "e.jsonl", cap=20000)
-    errores = []
+    errors = []
     seqs = []
     seqs_lock = threading.Lock()
 
-    def escritor(n):
+    def writer(n):
         try:
-            propios = [store.append("execve", pid=n, i=i) for i in range(500)]
+            mine = [store.append("execve", pid=n, i=i) for i in range(500)]
             with seqs_lock:
-                seqs.extend(propios)
-        except Exception as e:  # noqa: BLE001 — el test existe para detectar cualquier fallo
-            errores.append(e)
+                seqs.extend(mine)
+        except Exception as e:  # noqa: BLE001 — the test exists to catch anything
+            errors.append(e)
 
-    def lector():
+    def reader():
         try:
             for _ in range(200):
                 store.query(kind="execve", limit=50)
                 store.pending(limit=50)
                 store.stats()
         except Exception as e:  # noqa: BLE001
-            errores.append(e)
+            errors.append(e)
 
-    hilos = ([threading.Thread(target=escritor, args=(n,)) for n in range(20)]
-             + [threading.Thread(target=lector) for _ in range(5)])
-    for h in hilos:
-        h.start()
-    for h in hilos:
-        h.join()
+    threads = ([threading.Thread(target=writer, args=(n,)) for n in range(20)]
+               + [threading.Thread(target=reader) for _ in range(5)])
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
-    assert errores == []
+    assert errors == []
     assert len(seqs) == 10000
-    assert len(set(seqs)) == 10000, "hay números de secuencia duplicados"
+    assert len(set(seqs)) == 10000, "duplicate sequence numbers"
 
 
-def test_el_jsonl_es_parseable_linea_a_linea(tmp_path):
-    """Cada línea es independiente: una corrupta no invalida el fichero entero."""
+def test_the_jsonl_parses_line_by_line(tmp_path):
+    """Each line is independent: one corrupt line does not void the whole file."""
     path = tmp_path / "e.jsonl"
     store = EventStore(path, cap=100)
 
-    hilos = [threading.Thread(target=lambda n=n: [store.append("execve", pid=n, i=i)
-                                                  for i in range(50)])
-             for n in range(10)]
-    for h in hilos:
-        h.start()
-    for h in hilos:
-        h.join()
+    threads = [threading.Thread(target=lambda n=n: [store.append("execve", pid=n, i=i)
+                                                    for i in range(50)])
+               for n in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
-    lineas = path.read_text().strip().split("\n")
-    assert len(lineas) == 500
-    seqs = {json.loads(linea)["seq"] for linea in lineas}
+    lines = path.read_text().strip().split("\n")
+    assert len(lines) == 500
+    seqs = {json.loads(line)["seq"] for line in lines}
     assert len(seqs) == 500
 
 
-# ── capacidad ──────────────────────────────────────────────────
+# ── capacity ───────────────────────────────────────────────────
 
-def test_la_memoria_esta_acotada_y_las_perdidas_se_cuentan(tmp_path):
+def test_memory_is_bounded_and_losses_are_counted(tmp_path):
     store = EventStore(tmp_path / "e.jsonl", cap=10)
     for i in range(25):
         store.append("execve", pid=i)
 
     stats = store.stats()
     assert stats["in_memory"] == 10
-    # Descartar en silencio convertiría una pérdida de telemetría en algo invisible.
+    # Dropping silently would turn lost telemetry into something invisible.
     assert stats["dropped"] == 15
-    # Se conservan los más recientes.
+    # The most recent ones are kept.
     assert [e["pid"] for e in store.query(limit=100)] == list(range(15, 25))
 
 
-def test_el_jsonl_conserva_el_historico_completo(tmp_path):
-    """La memoria está acotada; el registro forense en disco, no."""
+def test_the_jsonl_keeps_the_full_history(tmp_path):
+    """Memory is bounded; the on-disk forensic record is not."""
     path = tmp_path / "e.jsonl"
     store = EventStore(path, cap=5)
     for i in range(30):
@@ -117,9 +117,9 @@ def test_el_jsonl_conserva_el_historico_completo(tmp_path):
     assert len(path.read_text().strip().split("\n")) == 30
 
 
-# ── filtros ────────────────────────────────────────────────────
+# ── filters ────────────────────────────────────────────────────
 
-def test_filtra_por_kind_y_por_pid(tmp_path):
+def test_filters_by_kind_and_by_pid(tmp_path):
     store = EventStore(tmp_path / "e.jsonl")
     store.append("execve", pid=100)
     store.append("execve", pid=200)
@@ -131,7 +131,7 @@ def test_filtra_por_kind_y_por_pid(tmp_path):
     assert store.query(pid=999) == []
 
 
-def test_since_seq_solo_devuelve_lo_nuevo(tmp_path):
+def test_since_seq_returns_only_what_is_new(tmp_path):
     store = EventStore(tmp_path / "e.jsonl")
     for i in range(5):
         store.append("execve", pid=i)
@@ -139,7 +139,7 @@ def test_since_seq_solo_devuelve_lo_nuevo(tmp_path):
     assert [e["pid"] for e in store.query(since_seq=3)] == [3, 4]
 
 
-def test_query_devuelve_los_mas_recientes_al_desbordar(tmp_path):
+def test_query_returns_the_most_recent_on_overflow(tmp_path):
     store = EventStore(tmp_path / "e.jsonl")
     for i in range(10):
         store.append("execve", pid=i)
@@ -147,26 +147,26 @@ def test_query_devuelve_los_mas_recientes_al_desbordar(tmp_path):
     assert [e["pid"] for e in store.query(limit=3)] == [7, 8, 9]
 
 
-# ── confirmación de eventos ────────────────────────────────────
+# ── event acknowledgement ──────────────────────────────────────
 
-def test_ack_evita_que_las_alertas_se_reanalicen_para_siempre(tmp_path):
-    """El bug original: kernel_events.json no se vaciaba ni se marcaba nunca."""
+def test_ack_stops_alerts_being_re_analysed_forever(tmp_path):
+    """The original bug: kernel_events.json was never emptied nor marked."""
     store = EventStore(tmp_path / "e.jsonl")
     for i in range(5):
         store.append("module_load", pid=i)
 
-    pendientes = store.pending("module_load")
-    assert len(pendientes) == 5
+    pending = store.pending("module_load")
+    assert len(pending) == 5
 
-    store.ack(max(e["seq"] for e in pendientes))
+    store.ack(max(e["seq"] for e in pending))
     assert store.pending("module_load") == []
 
     store.append("module_load", pid=99)
     assert [e["pid"] for e in store.pending("module_load")] == [99]
 
 
-def test_pending_devuelve_los_mas_antiguos_primero(tmp_path):
-    """Al revés que query: la confirmación debe avanzar sin dejar huecos."""
+def test_pending_returns_the_oldest_first(tmp_path):
+    """The opposite of query: acknowledgement must advance without gaps."""
     store = EventStore(tmp_path / "e.jsonl")
     for i in range(10):
         store.append("module_load", pid=i)
@@ -174,24 +174,24 @@ def test_pending_devuelve_los_mas_antiguos_primero(tmp_path):
     assert [e["pid"] for e in store.pending(limit=3)] == [0, 1, 2]
 
 
-def test_el_predicado_se_aplica_antes_del_recorte(tmp_path):
-    """Regresión: filtrar después del `limit` habría hecho inútil el disparador.
+def test_the_predicate_is_applied_before_the_limit(tmp_path):
+    """Regression: filtering after the limit would make the trigger useless.
 
-    `pending` devuelve los MÁS ANTIGUOS, y la proporción real es de miles de
-    eventos irrelevantes por cada uno que interesa. Recortando primero, la ventana
-    se llenaría de ruido y el evento marcado —que es el último— quedaría fuera:
-    el sistema no escalaría nunca nada.
+    `pending` returns the OLDEST events, and the real ratio is thousands of
+    irrelevant ones for every interesting one. Trimming first would fill the
+    window with noise and drop the flagged event — which is the last one — so
+    the system would never escalate anything.
     """
     store = EventStore(tmp_path / "e.jsonl")
     for i in range(100):
-        store.append("execve", pid=i, interesante=(i == 99))
+        store.append("execve", pid=i, interesting=(i == 99))
 
-    pendientes = store.pending(limit=5, predicate=lambda e: e["interesante"])
+    pending = store.pending(limit=5, predicate=lambda e: e["interesting"])
 
-    assert [e["pid"] for e in pendientes] == [99]
+    assert [e["pid"] for e in pending] == [99]
 
 
-def test_sin_predicado_se_comporta_como_siempre(tmp_path):
+def test_without_a_predicate_it_behaves_as_before(tmp_path):
     store = EventStore(tmp_path / "e.jsonl")
     for i in range(5):
         store.append("module_load", pid=i)
@@ -199,19 +199,19 @@ def test_sin_predicado_se_comporta_como_siempre(tmp_path):
     assert len(store.pending(limit=5)) == 5
 
 
-def test_el_predicado_convive_con_el_filtro_por_tipo(tmp_path):
+def test_the_predicate_coexists_with_the_kind_filter(tmp_path):
     store = EventStore(tmp_path / "e.jsonl")
-    store.append("module_load", pid=1, malo=True)
-    store.append("execve", pid=2, malo=True)
-    store.append("execve", pid=3, malo=False)
+    store.append("module_load", pid=1, bad=True)
+    store.append("execve", pid=2, bad=True)
+    store.append("execve", pid=3, bad=False)
 
-    pendientes = store.pending("execve", predicate=lambda e: e["malo"])
+    pending = store.pending("execve", predicate=lambda e: e["bad"])
 
-    assert [e["pid"] for e in pendientes] == [2]
+    assert [e["pid"] for e in pending] == [2]
 
 
-def test_ack_es_monotono(tmp_path):
-    """Un ack tardío o reintentado no puede hacer retroceder el puntero."""
+def test_ack_is_monotonic(tmp_path):
+    """A late or retried ack cannot move the pointer backwards."""
     store = EventStore(tmp_path / "e.jsonl")
     for i in range(5):
         store.append("module_load", pid=i)
@@ -221,7 +221,7 @@ def test_ack_es_monotono(tmp_path):
     assert store.pending("module_load") == []
 
 
-def test_ack_parcial(tmp_path):
+def test_partial_ack(tmp_path):
     store = EventStore(tmp_path / "e.jsonl")
     for i in range(5):
         store.append("module_load", pid=i)
@@ -230,8 +230,8 @@ def test_ack_parcial(tmp_path):
     assert [e["pid"] for e in store.pending("module_load")] == [3, 4]
 
 
-def test_ack_solo_afecta_a_pending_no_a_query(tmp_path):
-    """La evidencia forense sigue consultable después de confirmarla."""
+def test_ack_affects_pending_only_not_query(tmp_path):
+    """The forensic evidence stays queryable after acknowledgement."""
     store = EventStore(tmp_path / "e.jsonl")
     store.append("module_load", pid=1)
     store.ack(1)
@@ -240,18 +240,18 @@ def test_ack_solo_afecta_a_pending_no_a_query(tmp_path):
     assert len(store.query(kind="module_load")) == 1
 
 
-# ── degradación ────────────────────────────────────────────────
+# ── degradation ────────────────────────────────────────────────
 
-def test_funciona_sin_fichero(tmp_path):
-    """Modo solo-memoria: útil en tests y si el disco no está disponible."""
+def test_it_works_without_a_file(tmp_path):
+    """Memory-only mode: useful in tests and if the disk is unavailable."""
     store = EventStore(None)
     assert store.append("execve", pid=1) == 1
     assert len(store.query()) == 1
 
 
-def test_un_disco_que_falla_no_detiene_la_deteccion(tmp_path, monkeypatch):
-    """Detectar sin dejar rastro es malo; dejar de detectar es peor."""
-    store = EventStore(tmp_path / "no" / "existe" / "e.jsonl")
+def test_a_failing_disk_does_not_stop_detection(tmp_path, monkeypatch):
+    """Detecting without a trace is bad; not detecting at all is worse."""
+    store = EventStore(tmp_path / "does" / "not" / "exist" / "e.jsonl")
 
     assert store.append("execve", pid=1) == 1
     assert len(store.query()) == 1

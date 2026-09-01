@@ -6,17 +6,20 @@ venv/
 __pycache__/
 *.pyc
 
-# Telemetría de ejecución
-# events.jsonl y detections_fallback.jsonl los genera el EDR en marcha.
+# Runtime telemetry
+# events.jsonl and detections_fallback.jsonl are produced by the running EDR.
 *.jsonl
-# Ficheros del formato antiguo, sustituidos por events.jsonl en la fase 1.
+# Committed test fixtures are the exception.
+!tests/data/*.jsonl
+# Old-format files
 kernel_events.json
 execve_events.json
 
 # Tests
 .pytest_cache/
 
-# Laboratorio y evidencia (fases 6-7)
+# Lab and evidence (phases 6-7)
 lab/results/
 quarantine/
 edr.db
+results/

@@ -1,59 +1,43 @@
-"""Lectura de /proc: identidad estable de proceso.
+"""/proc readers giving a stable process identity.
 
-Funciones puras, sin BCC y sin estado global, para que sean testeables sin root.
-Ninguna lanza excepción: ante un proceso inexistente o inaccesible devuelven
-`None` o un valor vacío. Un sensor no puede caerse porque un proceso muriera
-entre dos lecturas — que es lo normal en /proc, no la excepción.
+Pure functions, no BCC, no global state. **None of them raise**: a process that
+vanishes between two reads is the normal case in /proc, not an error, and a
+sensor thread must not die because of it.
 
-**La idea central:** el identificador real de un proceso no es el PID, sino el par
-`(pid, starttime)`. El kernel recicla los PID; `starttime` (campo 22 de
-/proc/{pid}/stat, en jiffies desde el arranque) es inmutable durante toda la vida
-del proceso. Comparar ese par antes de señalizar es lo que impide matar a un
-proceso inocente que heredó el PID de un malicioso.
+The identity of a process is the pair `(pid, starttime)`, not the pid: the
+kernel recycles pids, but starttime is immutable for the life of the process.
 """
 
 import os
 
-# Raíz del pseudo-sistema de ficheros. Es una variable y no una constante literal
-# para que los tests puedan apuntarla a un /proc sintético: WSL2 no expone hilos
-# de kernel, así que casos como PF_KTHREAD no se pueden reproducir contra el /proc
-# real de esta máquina. Con esto se testean de forma determinista y en cualquier
-# entorno.
+# A module variable rather than a literal so tests can point it at a synthetic
+# tree. WSL2 exposes no kernel threads, so PF_KTHREAD cannot be reproduced
+# against the real /proc of this machine.
 PROC = "/proc"
 
-# Campos de /proc/{pid}/stat, indexados DESPUÉS del `comm` entre paréntesis.
-# El fichero es: pid (comm) state ppid pgrp ... y la numeración oficial empieza
-# en 1 para `pid`, así que el índice aquí es (número_de_campo - 3).
-_STAT_STATE = 0       # campo 3
-_STAT_PPID = 1        # campo 4
-_STAT_FLAGS = 6       # campo 9
-_STAT_STARTTIME = 19  # campo 22
+# Fields of /proc/{pid}/stat, indexed AFTER the parenthesised comm. Official
+# numbering starts at 1 for `pid`, so the index here is (field number - 3).
+_STAT_STATE = 0       # field 3
+_STAT_PPID = 1        # field 4
+_STAT_FLAGS = 6       # field 9
+_STAT_STARTTIME = 19  # field 22
 
-# Un proceso del kernel no tiene espacio de usuario: señalizarlo no tiene sentido.
+# A kernel thread has no userspace: signalling it makes no sense.
 PF_KTHREAD = 0x00200000
 
-# Cota de seguridad al recorrer la cadena de ancestros. /proc no debería contener
-# ciclos, pero un bucle infinito dentro del EDR sería un fallo peor que el que
-# intenta evitar.
+# /proc should not contain cycles, but an infinite loop inside the EDR would be
+# worse than the bug it guards against.
 _MAX_ANCESTRY_DEPTH = 64
 
-# Nanosegundos por tick de reloj. El campo 22 de /proc/{pid}/stat viene en ticks
-# (100 por segundo en este sistema), mientras que en eBPF la identidad se lee de
-# `task->start_boottime`, que está en nanosegundos. Se calcula en vez de fijarlo:
-# USER_HZ no es 100 en todos los kernels.
+# Computed rather than hardcoded: USER_HZ is not 100 on every kernel.
 NS_PER_TICK = 1_000_000_000 // os.sysconf("SC_CLK_TCK")
 
 
 def ns_to_ticks(ns):
-    """Convierte `task->start_boottime` a las unidades del campo 22 de /proc.
+    """Convert `task->start_boottime` into the units of /proc stat field 22.
 
-    Es exactamente la misma operación que hace el kernel en `nsec_to_clock_t()`,
-    una división entera, así que el resultado coincide al tick con lo que devuelve
-    `/proc`. Verificado contra `/proc/uptime` con diferencia 0,00 s.
-
-    Se usa `start_boottime` y no `start_time`: desde la 5.5 el kernel calcula el
-    campo 22 a partir del primero, y difieren en el tiempo que la máquina pasa
-    suspendida.
+    Same integer division the kernel does in `nsec_to_clock_t()`, so the result
+    matches /proc to the tick.
     """
     if ns is None:
         return None
@@ -61,15 +45,11 @@ def ns_to_ticks(ns):
 
 
 def read_stat(pid):
-    """Devuelve {comm, state, ppid, starttime, flags} o None si no se puede leer.
+    """Return {comm, state, ppid, starttime, flags}, or None if unreadable.
 
-    El parseo es la parte delicada: `comm` puede contener espacios y paréntesis
-    (en esta misma máquina existen procesos llamados `(sd-pam)` y `Relay(203)`),
-    así que hay que cortar por el ÚLTIMO paréntesis de cierre. Cortar por el
-    primero, o hacer un `split()` ingenuo, desplaza todos los campos y devuelve
-    un `starttime` incorrecto SIN error — que es exactamente la clase de fallo
-    silencioso que no puede permitirse algo de lo que dependen las decisiones de
-    seguridad.
+    Splits on the LAST closing parenthesis: `comm` can contain spaces and
+    parentheses, and a naive split shifts every later field, yielding a wrong
+    starttime with no error at all.
     """
     try:
         with open(f"{PROC}/{pid}/stat", "rb") as f:
@@ -100,29 +80,28 @@ def read_stat(pid):
 
 
 def starttime(pid):
-    """Instante de arranque del proceso en jiffies, o None si no existe."""
+    """Process start time in jiffies, or None if it does not exist."""
     stat = read_stat(pid)
     return stat["starttime"] if stat else None
 
 
 def comm(pid):
-    """Nombre corto del proceso, o None."""
+    """Short process name, or None."""
     stat = read_stat(pid)
     return stat["comm"] if stat else None
 
 
 def proc_key(pid):
-    """Identidad estable como cadena: "4711:195964". None si el proceso no existe."""
+    """Stable identity as a string: "4711:195964". None if the process is gone."""
     st = starttime(pid)
     return None if st is None else f"{pid}:{st}"
 
 
 def is_alive(pid, expected_starttime):
-    """True si el PID sigue siendo EL MISMO proceso que cuando se capturó el evento.
+    """True if the pid is still THE SAME process it was when captured.
 
-    Un `expected_starttime` en None significa que no se pudo capturar la identidad
-    (el proceso ya había muerto al procesar el evento). En ese caso no se puede
-    afirmar la identidad, así que se devuelve False: ante la duda, no se actúa.
+    A None `expected_starttime` means identity was never captured, so it cannot
+    be asserted: when in doubt, do not act.
     """
     if expected_starttime is None:
         return False
@@ -130,11 +109,10 @@ def is_alive(pid, expected_starttime):
 
 
 def is_kernel_thread(pid):
-    """True si es un hilo de kernel.
+    """True for a kernel thread.
 
-    Se mira el flag PF_KTHREAD de la task, que es la señal autoritativa. Si no se
-    puede leer el stat, se recurre a /proc/{pid}/exe: los hilos de kernel no
-    tienen ejecutable que resolver.
+    PF_KTHREAD is the authoritative signal; /proc/{pid}/exe is the fallback,
+    since kernel threads have no executable to resolve.
     """
     stat = read_stat(pid)
     if stat is not None:
@@ -147,11 +125,10 @@ def is_kernel_thread(pid):
 
 
 def ancestors(pid):
-    """Cadena de ancestros desde el padre de `pid` hasta PID 1, en orden ascendente.
+    """Ancestor chain from the parent of `pid` up to pid 1.
 
-    Se usa para la autoprotección: el EDR no puede señalizar a ninguno de sus
-    propios ancestros. En este sistema el servidor MCP es hijo del orquestador,
-    así que recorrer la cadena cubre ambos con una sola comprobación.
+    Used for self-protection: the MCP server is a child of the orchestrator, so
+    walking the chain covers both with a single check.
     """
     chain = []
     seen = set()
@@ -172,7 +149,7 @@ def ancestors(pid):
 
 
 def _read_uid(pid):
-    """UID real del proceso, leído de la línea `Uid:` de /proc/{pid}/status."""
+    """Real uid, from the `Uid:` line of /proc/{pid}/status."""
     try:
         with open(f"{PROC}/{pid}/status", "r") as f:
             for line in f:
@@ -184,10 +161,10 @@ def _read_uid(pid):
 
 
 def cmdline(pid):
-    """Línea de comandos completa. /proc la entrega separada por bytes nulos.
+    """Full command line. /proc delivers it null-separated.
 
-    Es lo que distingue `curl https://api.empresa.com/health` de
-    `curl -s http://45.33.x.x/x.sh`, que para el `comm` son idénticos.
+    It is what tells `curl https://api.company.com/health` apart from
+    `curl -s http://45.33.x.x/x.sh`, identical as far as `comm` is concerned.
     """
     try:
         with open(f"{PROC}/{pid}/cmdline", "rb") as f:
@@ -201,11 +178,10 @@ def cmdline(pid):
 
 
 def snapshot(pid):
-    """Retrato del proceso en un instante, o None si ya no existe.
+    """Point-in-time portrait of a process, or None if it is gone.
 
-    `exe_deleted` merece atención: un ejecutable borrado mientras sigue corriendo
-    es omnipresente en malware moderno, y detectarlo no cuesta nada porque el
-    propio kernel añade el sufijo " (deleted)" al enlace.
+    `exe_deleted` is free to detect — the kernel appends " (deleted)" to the
+    link itself — and a deleted executable still running is a classic signal.
     """
     stat = read_stat(pid)
     if stat is None:

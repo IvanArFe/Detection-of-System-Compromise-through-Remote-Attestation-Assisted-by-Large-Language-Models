@@ -45,10 +45,9 @@ TABLES = [
         """,
     ),
     (
-        "detections: columnas de métricas y de las fases 5-7",
-        # Se añaden ahora aunque casi ninguna se rellene todavía: migrar una tabla
-        # con datos es bastante más incómodo que crear columnas vacías hoy. La fase
-        # 2 ya empieza a producir model, latency_ms y los contadores de tokens.
+        "detections: metrics and phase 5-7 columns",
+        # Added now even though most are not filled yet: migrating a table with
+        # data in it is far more awkward than creating empty columns today.
         """
         ALTER TABLE detections
             ADD COLUMN IF NOT EXISTS model           TEXT,
@@ -63,18 +62,18 @@ TABLES = [
         """,
     ),
     (
-        "detections: permitir pid y process nulos",
-        # Un veredicto NOTHING no lleva PID, y esas filas son imprescindibles para
-        # calcular la tasa de falsos negativos. Con NOT NULL no se pueden insertar.
+        "detections: allow null pid and process",
+        # A NOTHING verdict carries no pid, and those rows are what the
+        # false-negative rate is computed from. NOT NULL rejects them.
         """
         ALTER TABLE detections ALTER COLUMN pid     DROP NOT NULL;
         ALTER TABLE detections ALTER COLUMN process DROP NOT NULL;
         """,
     ),
     (
-        "índices",
-        # La consulta de deduplicación (pid + process + created_at) hacía un
-        # escaneo completo de la tabla en cada ciclo.
+        "indexes",
+        # The dedup query (pid + process + created_at) used to full-scan the
+        # table on every cycle.
         """
         CREATE INDEX IF NOT EXISTS ix_detections_dedup
             ON detections (pid, process, created_at DESC);
@@ -122,9 +121,8 @@ def main():
     project_ref = get_project_ref(supabase_url)
     print(f"[*] Setting up database for project: {project_ref}")
 
-    # Todas las sentencias son idempotentes (IF NOT EXISTS / DROP NOT NULL sobre
-    # una columna que ya lo permite), así que el script se puede relanzar sin
-    # riesgo cada vez que el esquema evolucione.
+    # Every statement is idempotent, so this can be re-run safely whenever the
+    # schema evolves.
     for name, sql in TABLES:
         run_sql(project_ref, access_token, sql)
         print(f"[+] {name}: OK")
